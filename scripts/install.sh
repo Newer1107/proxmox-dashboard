@@ -45,11 +45,9 @@ cat > "${BIN}" << 'WRAPPER'
 #!/usr/bin/env bash
 export TERM="${TERM:-linux}"
 export PYTHONUNBUFFERED=1
-# Hide cursor on tty, restore on exit
-tput civis 2>/dev/null || true
-trap 'tput cnorm 2>/dev/null || true; clear' EXIT INT TERM
+printf '\033[?25l'
 clear
-exec python3 /opt/proxmox-dashboard/src/dashboard.py "$@"
+exec /usr/bin/python3 /opt/proxmox-dashboard/src/dashboard.py "$@"
 WRAPPER
 chmod +x "${BIN}"
 ok "Dashboard installed → ${BIN}"

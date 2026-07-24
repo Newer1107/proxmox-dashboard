@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 from collections import deque
 from datetime import datetime
-from typing import IO, Optional
+from typing import Optional
 
 import psutil
 from textual.app import App, ComposeResult
@@ -769,27 +770,55 @@ class TCETDashboard(App):
                 pass
 
 
-def _open_tty() -> Optional[IO]:
-    """Open the terminal device for Textual to render onto.
+def _claim_tty() -> bool:
+    """Fork + setsid to make /dev/tty1 the controlling terminal.
 
-    Textual's default driver opens /dev/tty (the controlling terminal).
-    When running via systemd with StandardInput=tty / StandardOutput=tty,
-    the process has no controlling terminal, so /dev/tty fails.  Fall
-    back to /dev/tty1 explicitly.
+    systemd services with StandardInput=tty/StandardOutput=tty do NOT
+    set the controlling terminal, so /dev/tty fails with ENXIO.
+    Textual's LinuxDriver opens /dev/tty and silently breaks without one.
     """
-    for dev in ("/dev/tty", "/dev/tty1"):
+    try:
+        pid = os.fork()
+    except OSError:
+        return False
+
+    if pid > 0:
+        def _forward(signum, frame):
+            try:
+                os.kill(pid, signum)
+            except OSError:
+                pass
+
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, _forward)
+
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        os._exit(0)
+
+    os.setsid()
+
+    for dev in ("/dev/tty1", "/dev/tty"):
         try:
             fd = os.open(dev, os.O_RDWR)
-            return os.fdopen(fd, "r+b", buffering=0)
         except OSError:
             continue
-    return None
+        os.dup2(fd, 0)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        if fd > 2:
+            os.close(fd)
+        return True
+
+    return False
 
 
 def main():
+    _claim_tty()
     app = TCETDashboard()
-    tty = _open_tty()
-    app.run(tty=tty)
+    app.run()
 
 
 if __name__ == "__main__":
