@@ -1014,7 +1014,15 @@ class OperationsDashboard(App):
 #  TTY CLAIM + ENTRY
 # ══════════════════════════════════════════════════════════════════════════════
 
+CRASH_LOG = "/tmp/proxmox-dashboard-crash.log"
+
+
 def _claim_tty() -> bool:
+    """Fork + setsid to make /dev/tty1 the controlling terminal.
+
+    Redirects stdin + stdout to tty1 but leaves stderr on journal
+    so crash traces are visible in journalctl.
+    """
     try:
         pid = os.fork()
     except OSError:
@@ -1032,24 +1040,34 @@ def _claim_tty() -> bool:
         except ChildProcessError:
             pass
         os._exit(0)
-    os.setsid()
+    try:
+        os.setsid()
+    except OSError:
+        pass
     for dev in ("/dev/tty1", "/dev/tty"):
         try:
             fd = os.open(dev, os.O_RDWR)
-            os.dup2(fd, 0)
-            os.dup2(fd, 1)
-            os.dup2(fd, 2)
-            if fd > 2:
-                os.close(fd)
-            return True
         except OSError:
             continue
+        os.dup2(fd, 0)
+        os.dup2(fd, 1)
+        # stderr stays on journal so crash traces are logged
+        if fd > 2:
+            os.close(fd)
+        return True
     return False
 
 
 def main():
     _claim_tty()
-    OperationsDashboard().run()
+    try:
+        OperationsDashboard().run()
+    except Exception:
+        import traceback
+        with open(CRASH_LOG, "a") as f:
+            f.write(f"=== crash at {datetime.now()} ===\n")
+            traceback.print_exc(file=f)
+        raise
 
 
 if __name__ == "__main__":
