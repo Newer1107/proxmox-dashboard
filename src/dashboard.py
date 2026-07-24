@@ -1019,7 +1019,7 @@ CRASH_LOG = "/tmp/proxmox-dashboard-crash.log"
 
 
 def main():
-    """Redirect open('/dev/tty') → /dev/tty1 so Textual renders correctly."""
+    """Make Textual render to tty1 by redirecting stderr (its fallback path)."""
     import builtins as _B
     _real_open = _B.open
 
@@ -1029,6 +1029,13 @@ def main():
         return _real_open(file, mode, *args, **kw)
 
     _B.open = _tty_redirect
+
+    # Textual falls back to stderr when /dev/tty is unavailable.
+    # Redirect stderr → stdout → /dev/tty1 (set by StandardOutput=tty).
+    try:
+        os.dup2(1, 2)
+    except OSError:
+        pass
 
     app = OperationsDashboard()
     try:
