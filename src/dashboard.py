@@ -1028,7 +1028,8 @@ def main():
         from textual.drivers.linux_driver import LinuxDriver as _LD
         _orig_init = _LD.__init__
 
-        def _force_tty(self, app, *, tty=None):
+        def _force_tty(self, app, **kwargs):
+            tty = kwargs.pop("tty", None)
             if tty is None:
                 for dev in ("/dev/tty1", "/dev/tty"):
                     try:
@@ -1038,7 +1039,7 @@ def main():
                         continue
                 else:
                     tty = sys.stdout
-            _orig_init(self, app, tty=tty)
+            _orig_init(self, app, tty=tty, **kwargs)
 
         _LD.__init__ = _force_tty
     except Exception:
