@@ -1012,60 +1012,41 @@ class OperationsDashboard(App):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TTY CLAIM + ENTRY
+#  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 CRASH_LOG = "/tmp/proxmox-dashboard-crash.log"
 
 
-def _claim_tty() -> bool:
-    """Fork + setsid to make /dev/tty1 the controlling terminal.
-
-    Redirects stdin + stdout to tty1 but leaves stderr on journal
-    so crash traces are visible in journalctl.
-    """
-    try:
-        pid = os.fork()
-    except OSError:
-        return False
-    if pid > 0:
-        def _fw(signum, frame):
-            try:
-                os.kill(pid, signum)
-            except OSError:
-                pass
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            signal.signal(sig, _fw)
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-        os._exit(0)
-    try:
-        os.setsid()
-    except OSError:
-        pass
-    for dev in ("/dev/tty1", "/dev/tty"):
-        try:
-            fd = os.open(dev, os.O_RDWR)
-        except OSError:
-            continue
-        os.dup2(fd, 0)
-        os.dup2(fd, 1)
-        # stderr stays on journal so crash traces are logged
-        if fd > 2:
-            os.close(fd)
-        return True
-    return False
-
-
 def main():
-    _claim_tty()
+    """Force Textual to render to /dev/tty1 via stdout or direct open."""
+    # Monkey-patch LinuxDriver so it never tries to open /dev/tty
+    # (which doesn't exist in systemd services without controlling terminal).
+    # Instead, use stdout (fd 1 = /dev/tty1 via StandardOutput=tty)
+    # or open /dev/tty1 directly.
     try:
-        # Use stdout (connected to /dev/tty1 by systemd's StandardOutput=tty)
-        # even if /dev/tty (controlling terminal) isn't available.
-        app = OperationsDashboard()
-        app.run(tty=sys.stdout)
+        from textual.drivers.linux_driver import LinuxDriver as _LD
+        _orig_init = _LD.__init__
+
+        def _force_tty(self, app, *, tty=None):
+            if tty is None:
+                for dev in ("/dev/tty1", "/dev/tty"):
+                    try:
+                        tty = open(dev, "wb")
+                        break
+                    except OSError:
+                        continue
+                else:
+                    tty = sys.stdout
+            _orig_init(self, app, tty=tty)
+
+        _LD.__init__ = _force_tty
+    except Exception:
+        pass  # Fallback: Textual will try /dev/tty
+
+    app = OperationsDashboard()
+    try:
+        app.run()
     except Exception:
         import traceback
         with open(CRASH_LOG, "a") as f:
