@@ -11,6 +11,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 from collections import deque
 from datetime import datetime
@@ -1061,7 +1062,10 @@ def _claim_tty() -> bool:
 def main():
     _claim_tty()
     try:
-        OperationsDashboard().run()
+        # Use stdout (connected to /dev/tty1 by systemd's StandardOutput=tty)
+        # even if /dev/tty (controlling terminal) isn't available.
+        app = OperationsDashboard()
+        app.run(tty=sys.stdout)
     except Exception:
         import traceback
         with open(CRASH_LOG, "a") as f:
