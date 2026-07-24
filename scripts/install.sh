@@ -72,8 +72,7 @@ StandardOutput=tty
 StandardError=journal
 TTYPath=/dev/tty1
 TTYReset=yes
-TTYVHangup=yes
-TTYVTDisallocate=no
+TTYVTDisallocate=yes
 Environment=TERM=linux
 Environment=HOME=/root
 Environment=PYTHONUNBUFFERED=1

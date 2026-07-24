@@ -6,19 +6,18 @@ Tailored for: i7-14700 · SK Hynix 1TB NVMe · LVM-thin · PVE 9.2.4
 
 from __future__ import annotations
 
-import asyncio
 import json
+import os
 import re
 import subprocess
 import time
 from collections import deque
 from datetime import datetime
-from typing import Optional
+from typing import IO, Optional
 
 import psutil
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
-from textual.reactive import reactive
+from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
 from textual.widgets import Static
 
@@ -133,8 +132,8 @@ class SysData:
         self.hostname:     str   = sh(["hostname"]) or "proxmox"
         self.kernel:       str   = sh(["uname", "-r"])
         self.pve_ver:      str   = ""
-        self.node_ip:      str   = "175.175.3.186"
-        self.ts_ip:        str   = "100.86.18.58"
+        self.node_ip:      str   = ""
+        self.ts_ip:        str   = ""
 
         # One-time
         self.pve_ver = "PVE 9.2.4"
@@ -770,8 +769,27 @@ class TCETDashboard(App):
                 pass
 
 
+def _open_tty() -> Optional[IO]:
+    """Open the terminal device for Textual to render onto.
+
+    Textual's default driver opens /dev/tty (the controlling terminal).
+    When running via systemd with StandardInput=tty / StandardOutput=tty,
+    the process has no controlling terminal, so /dev/tty fails.  Fall
+    back to /dev/tty1 explicitly.
+    """
+    for dev in ("/dev/tty", "/dev/tty1"):
+        try:
+            fd = os.open(dev, os.O_RDWR)
+            return os.fdopen(fd, "r+b", buffering=0)
+        except OSError:
+            continue
+    return None
+
+
 def main():
-    TCETDashboard().run()
+    app = TCETDashboard()
+    tty = _open_tty()
+    app.run(tty=tty)
 
 
 if __name__ == "__main__":

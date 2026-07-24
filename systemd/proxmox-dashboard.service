@@ -1,9 +1,7 @@
 [Unit]
-Description=Proxmox Node Dashboard (TUI on tty1)
+Description=TCET COE Proxmox 1 Node Dashboard
 After=network.target pve-cluster.service pvedaemon.service
 Wants=network.target
-# Ensure we start after Proxmox services, but don't hard-depend on them
-# so the dashboard still runs if PVE services are degraded
 
 [Service]
 Type=simple
@@ -16,26 +14,23 @@ StandardOutput=tty
 StandardError=journal
 TTYPath=/dev/tty1
 TTYReset=yes
-TTYVHangup=yes
-TTYVTDisallocate=no
+TTYVTDisallocate=yes
 
 # Terminal environment for rich TUI rendering
 Environment=TERM=linux
 Environment=HOME=/root
+Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# The dashboard script
 ExecStart=/usr/local/bin/proxmox-dashboard
 
 # Restart policy — restart immediately on crash, give up after 5 rapid failures
 Restart=always
-RestartSec=2s
+RestartSec=3s
 StartLimitIntervalSec=60s
 StartLimitBurst=5
 
 # Security: still need root to call pvesh/qm/pct/zpool
-# Keep minimal privileges otherwise
-PrivateTmp=no
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 
