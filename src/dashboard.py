@@ -1019,31 +1019,16 @@ CRASH_LOG = "/tmp/proxmox-dashboard-crash.log"
 
 
 def main():
-    """Force Textual to render to /dev/tty1 via stdout or direct open."""
-    # Monkey-patch LinuxDriver so it never tries to open /dev/tty
-    # (which doesn't exist in systemd services without controlling terminal).
-    # Instead, use stdout (fd 1 = /dev/tty1 via StandardOutput=tty)
-    # or open /dev/tty1 directly.
-    try:
-        from textual.drivers.linux_driver import LinuxDriver as _LD
-        _orig_init = _LD.__init__
+    """Redirect open('/dev/tty') → /dev/tty1 so Textual renders correctly."""
+    import builtins as _B
+    _real_open = _B.open
 
-        def _force_tty(self, app, **kwargs):
-            tty = kwargs.pop("tty", None)
-            if tty is None:
-                for dev in ("/dev/tty1", "/dev/tty"):
-                    try:
-                        tty = open(dev, "wb")
-                        break
-                    except OSError:
-                        continue
-                else:
-                    tty = sys.stdout
-            _orig_init(self, app, tty=tty, **kwargs)
+    def _tty_redirect(file, mode="r", *args, **kw):
+        if isinstance(file, str) and file == "/dev/tty":
+            file = "/dev/tty1"
+        return _real_open(file, mode, *args, **kw)
 
-        _LD.__init__ = _force_tty
-    except Exception:
-        pass  # Fallback: Textual will try /dev/tty
+    _B.open = _tty_redirect
 
     app = OperationsDashboard()
     try:
