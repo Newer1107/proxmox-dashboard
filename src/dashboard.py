@@ -753,7 +753,7 @@ class GraphArea(Static):
         mn = f"{min(vals):.1f}" if vals else "─"
         mx = f"{max(vals):.1f}" if vals else "─"
         lines = [
-            f"  [{colour}]━━━[/{colour}] [{bold or ''}{colour}]  {title}[/{bold or ''}{colour}]  {val_s}"
+            f"  [{colour}]━━━[/{colour}] [bold {colour}]{title}[/bold]  {val_s}"
             f"[{DIM}]     min[/{DIM}] [white]{mn}[/white][{DIM}]  max[/{DIM}] [white]{mx}[/white]"
             f"  {extra}",
             f"  {sp}",
@@ -774,8 +774,16 @@ class GraphArea(Static):
         return lines
 
     def render(self) -> str:
+        try:
+            return self._render_graphs()
+        except Exception as exc:
+            return (
+                f"  [{DIM}]graph render error: {exc}[/{DIM}]\n"
+                f"  [{DIM}]will retry on next tick[/{DIM}]"
+            )
+
+    def _render_graphs(self) -> str:
         d = self.d
-        # Dynamic width: 240 - 2 (screen border) - 4 (padding)
         w = 234
 
         lines = []
