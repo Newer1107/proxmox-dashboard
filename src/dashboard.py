@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-TCET Centre of Excellence — Proxmox 1 Node Dashboard
-Tailored for: i7-14700 · SK Hynix 1TB NVMe · LVM-thin · PVE 9.2.4
+Proxmox Node Dashboard — NOC-style operations view
+Aggregated metrics, history graphs, alerts, activity feed.
+No individual VM/container listings.
 """
 
 from __future__ import annotations
@@ -19,8 +20,31 @@ from typing import Optional
 import psutil
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widget import Widget
 from textual.widgets import Static
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+OK   = "#22c55e"
+WARN = "#f59e0b"
+CRIT = "#ef4444"
+INFO = "#38bdf8"
+DIM  = "#607090"
+DIM2 = "#3a4a6a"
+AMBER_HI = "#f59e0b"
+AMBER_LO = "#92600a"
+BG       = "#0a0e1a"
+BG2      = "#0d1220"
+BORDER   = "#1e2a3a"
+GLYPH    = "#2a3a5a"
+
+DIVIDER = f"[{DIM2}]{'─' * 46}[/{DIM2}]"
+THINLN  = f"[{GLYPH}]{'─' * 46}[/{GLYPH}]"
+
+BLOCKS = " ▁▂▃▄▅▆▇█"
+MINI   = " ▂▄▅▆▇█"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -34,133 +58,257 @@ def sh(cmd: list[str], timeout: int = 6) -> str:
     except Exception:
         return ""
 
+
 def sh_json(cmd: list[str], timeout: int = 6):
     raw = sh(cmd, timeout)
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception:
-        return None
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+    return None
 
-def human(b: float, pad: int = 7) -> str:
+
+def human(b: float) -> str:
     for u in ("B ", "KB", "MB", "GB", "TB"):
         if abs(b) < 1024:
-            return f"{b:6.1f} {u}"
+            return f"{b:>5.1f} {u}"
         b /= 1024
-    return f"{b:6.1f} PB"
+    return f"{b:>5.1f} PB"
 
-def spark(values: deque, width: int = 24) -> str:
-    BLOCKS = " ▁▂▃▄▅▆▇█"
+
+def human_int(b: float) -> str:
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if abs(b) < 1024:
+            return f"{int(b)} {u}"
+        b /= 1024
+    return f"{int(b)} PB"
+
+
+def pct_bar(pct: float, width: int = 12, style: bool = True) -> str:
+    filled = max(0, min(int(pct / 100 * width), width))
+    empty = width - filled
+    color = "#22c55e" if pct < 60 else "#f59e0b" if pct < 80 else "#ef4444"
+    bar = "█" * filled + "░" * empty
+    return f"[{color}]{bar}[/{color}]" if style else bar
+
+
+def pct_color(pct: float) -> str:
+    return OK if pct < 60 else WARN if pct < 80 else CRIT
+
+
+def spark(values: list[float], width: int = 20) -> str:
     if not values:
         return "─" * width
-    vals = list(values)[-width:]
+    vals = values[-width:]
     lo, hi = min(vals), max(vals)
     span = hi - lo or 1
-    chars = [BLOCKS[int((v - lo) / span * 8)] for v in vals]
-    return " " * (width - len(chars)) + "".join(chars)
+    return "".join(BLOCKS[min(int((v - lo) / span * 8), 8)] for v in vals)
 
-def pct_bar(pct: float, width: int = 22) -> tuple[str, str]:
-    """Returns (bar_markup, color)"""
-    if pct < 60:   color = "#22c55e"   # green
-    elif pct < 80: color = "#f59e0b"   # amber
-    else:          color = "#ef4444"   # red
-    filled = int(pct / 100 * width)
-    empty  = width - filled
-    bar = f"[{color}]{'█' * filled}[/{color}][#2a2a3a]{'▓' * empty}[/#2a2a3a]"
-    return bar, color
 
-def pct_style(pct: float) -> str:
-    if pct < 60:   return "#22c55e"
-    elif pct < 80: return "#f59e0b"
-    return "#ef4444"
+def spark_color(values: list[float], width: int = 20, color: str = OK) -> str:
+    raw = spark(values, width)
+    return f"[{color}]{raw}[/{color}]"
 
-DIVIDER = "[#2a3a5a]" + "─" * 46 + "[/#2a3a5a]"
-THIN    = "[#1e2a3a]" + "─" * 46 + "[/#1e2a3a]"
+
+def compact_cores(cores: list[float], per_row: int = 8) -> list[str]:
+    rows = []
+    for i in range(0, len(cores), per_row):
+        chunk = cores[i : i + per_row]
+        line = "  "
+        for c in chunk:
+            col = pct_color(c)
+            idx = min(int(c / 100 * 5), 5)
+            line += f"[{col}]{MINI[idx]}[/{col}]"
+        rows.append(line)
+    return rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DATA COLLECTOR — tailored to this exact machine
+#  HISTORY RING BUFFER
 # ══════════════════════════════════════════════════════════════════════════════
 
-class SysData:
-    HIST = 60
+class History:
+    """Fixed-length time-series buffer with render helpers."""
+
+    def __init__(self, maxlen: int = 60):
+        self._data: deque[float] = deque(maxlen=maxlen)
+
+    def add(self, v: float) -> None:
+        self._data.append(v)
+
+    def get(self) -> list[float]:
+        return list(self._data)
+
+    def last(self, default: float = 0.0) -> float:
+        return self._data[-1] if self._data else default
+
+    def spark(self, width: int = 20) -> str:
+        if not self._data:
+            return f"[{DIM}]{'─' * width}[/{DIM}]"
+        vals = list(self._data)[-width:]
+        lo, hi = min(vals), max(vals)
+        span = hi - lo or 1
+        raw = "".join(BLOCKS[min(int((v - lo) / span * 8), 8)] for v in vals)
+        col = OK if self.last() < 60 else WARN if self.last() < 80 else CRIT
+        return f"[{col}]{raw}[/{col}]"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ALERT & EVENT TRACKING
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Alert:
+    severity: str  # "ok" | "warn" | "crit"
+    message: str
+    time: str
+
+    def __init__(self, severity: str, message: str):
+        self.severity = severity
+        self.message = message
+        self.time = datetime.now().strftime("%H:%M")
+
+
+class Event:
+    message: str
+    time: str
+    kind: str  # "info" | "warn" | "ok"
+
+    def __init__(self, message: str, kind: str = "info"):
+        self.message = message
+        self.kind = kind
+        self.time = datetime.now().strftime("%H:%M")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATA COLLECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NodeData:
+    """Aggregated node data collector — fast + slow ticks."""
+
+    HIST_LEN = 60
 
     def __init__(self):
-        # CPU
-        self.cpu_pct:      float = 0.0
-        self.cpu_cores:    list[float] = []
-        self.cpu_freq:     float = 0.0
-        self.cpu_temp:     Optional[float] = None
-        self.load:         tuple = (0.0, 0.0, 0.0)
-        self.cpu_hist:     deque = deque(maxlen=self.HIST)
+        # ── CPU ──
+        self.cpu_pct: float = 0.0
+        self.cpu_cores: list[float] = []
+        self.cpu_freq: float = 0.0
+        self.cpu_temp: Optional[float] = None
+        self.load: tuple = (0.0, 0.0, 0.0)
+        self.cpu_hist = History(self.HIST_LEN)
 
-        # Memory
-        self.mem_pct:      float = 0.0
-        self.mem_used:     int   = 0
-        self.mem_total:    int   = 0
-        self.mem_avail:    int   = 0
-        self.swap_pct:     float = 0.0
-        self.swap_used:    int   = 0
-        self.swap_total:   int   = 0
-        self.mem_hist:     deque = deque(maxlen=self.HIST)
+        # ── Memory ──
+        self.mem_pct: float = 0.0
+        self.mem_used: int = 0
+        self.mem_total: int = 0
+        self.mem_avail: int = 0
+        self.mem_cached: int = 0
+        self.mem_buffers: int = 0
+        self.swap_pct: float = 0.0
+        self.swap_used: int = 0
+        self.swap_total: int = 0
+        self.mem_hist = History(self.HIST_LEN)
+        self.swap_hist = History(self.HIST_LEN)
 
-        # Network  
-        self.net_up:       float = 0.0
-        self.net_dn:       float = 0.0
-        self.net_tx_total: int   = 0
-        self.net_rx_total: int   = 0
-        self.net_up_hist:  deque = deque(maxlen=self.HIST)
-        self.net_dn_hist:  deque = deque(maxlen=self.HIST)
-        self._p_sent:      int   = 0
-        self._p_recv:      int   = 0
-        self._p_time:      float = time.time()
+        # ── Network ──
+        self.net_up: float = 0.0
+        self.net_dn: float = 0.0
+        self.net_tx_total: int = 0
+        self.net_rx_total: int = 0
+        self.net_up_hist = History(self.HIST_LEN)
+        self.net_dn_hist = History(self.HIST_LEN)
+        self.net_errs: int = 0
+        self._p_sent: int = 0
+        self._p_recv: int = 0
+        self._p_errin: int = 0
+        self._p_errout: int = 0
+        self._p_time: float = time.time()
 
-        # Storage
-        self.root_pct:     float = 0.0
-        self.root_used:    int   = 0
-        self.root_total:   int   = 0
-        self.lvm_pct:      float = 0.0   # data% from lvs
-        self.lvm_used_gb:  float = 0.0
+        # ── Storage ──
+        self.root_pct: float = 0.0
+        self.root_used: int = 0
+        self.root_total: int = 0
+        self.lvm_pct: float = 0.0
+        self.lvm_used_gb: float = 0.0
         self.lvm_total_gb: float = 0.0
+        self.disk_r_hist = History(self.HIST_LEN)
+        self.disk_w_hist = History(self.HIST_LEN)
+        self._p_disk_r: int = 0
+        self._p_disk_w: int = 0
+        self._p_disk_time: float = time.time()
 
-        # VMs
-        self.vms:          list[dict] = []
-        self.snapshots:    list[dict] = []
+        # ── ZFS ──
+        self.zfs_pools: list[dict] = []
+        self.zfs_arc_max: int = 0
+        self.zfs_arc_used: int = 0
 
-        # System
-        self.uptime:       float = 0.0
-        self.hostname:     str   = sh(["hostname"]) or "proxmox"
-        self.kernel:       str   = sh(["uname", "-r"])
-        self.pve_ver:      str   = ""
-        self.node_ip:      str   = ""
-        self.ts_ip:        str   = ""
+        # ── Virtualization (aggregated) ──
+        self.vms_running: int = 0
+        self.vms_stopped: int = 0
+        self.vms_total: int = 0
+        self.vm_total_vcpus: int = 0
+        self.vm_total_maxmem: int = 0
+        self.vm_total_mem: int = 0
+        self.vm_cpu_pct: float = 0.0
+        self.vm_mem_pct: float = 0.0
+        self.vm_disk_r: int = 0
+        self.vm_disk_w: int = 0
+        self.vm_net_in: int = 0
+        self.vm_net_out: int = 0
+        self.vm_cpu_hist = History(self.HIST_LEN)
+        self.vm_mem_hist = History(self.HIST_LEN)
 
-        # One-time
-        self.pve_ver = "PVE 9.2.4"
+        # ── LXCs (aggregated) ──
+        self.lxc_running: int = 0
+        self.lxc_stopped: int = 0
+        self.lxc_total: int = 0
+        self.lxc_cpu_pct: float = 0.0
+        self.lxc_mem_pct: float = 0.0
+
+        # ── System ──
+        self.uptime: float = 0.0
+        self.hostname: str = sh(["hostname"]) or "proxmox"
+        self.kernel: str = sh(["uname", "-r"])
+        self.pve_ver: str = ""
+        self.node_ip: str = ""
+        self.ts_ip: str = ""
+
+        # ── Alerts & Events ──
+        self.alerts: list[Alert] = []
+        self.events: deque[Event] = deque(maxlen=20)
+        self._last_vm_count: int = 0
+        self._last_lxc_count: int = 0
+
+        # ── Status ──
+        self.overall_status: str = "ok"  # ok | warn | crit
+        self.tick_n: int = 0
+
+        # One-time probes
         v = sh(["pveversion"])
         if v:
             m = re.search(r'pve-manager[:/\s]+(\S+)', v)
             if m:
                 self.pve_ver = f"PVE {m.group(1)}"
+        self._net_ips()
 
-    # ── fast (1s) ────────────────────────────────────────────────────────────
+    # ── Fast tick (1s) ─────────────────────────────────────────────────
 
     def tick_fast(self):
+        self.tick_n += 1
         self._cpu()
         self._mem()
         self._net()
-        self._storage_fast()
+        self._disk_io()
         self.uptime = time.time() - psutil.boot_time()
 
     def _cpu(self):
-        self.cpu_pct   = psutil.cpu_percent(interval=None)
+        self.cpu_pct = psutil.cpu_percent(interval=None)
         self.cpu_cores = psutil.cpu_percent(interval=None, percpu=True)
         f = psutil.cpu_freq()
-        self.cpu_freq  = f.current if f else 0.0
-        self.load      = psutil.getloadavg()
-        self.cpu_hist.append(self.cpu_pct)
-        # temperature — try coretemp first, then acpitz fallback
+        self.cpu_freq = f.current if f else 0.0
+        self.load = psutil.getloadavg()
+        self.cpu_hist.add(self.cpu_pct)
         try:
             temps = psutil.sensors_temperatures()
             for key in ("coretemp", "k10temp", "cpu_thermal", "acpitz", "iwlwifi"):
@@ -168,7 +316,6 @@ class SysData:
                     self.cpu_temp = temps[key][0].current
                     break
             else:
-                # try /sys/class/thermal
                 raw = sh(["cat", "/sys/class/thermal/thermal_zone0/temp"])
                 if raw.isdigit():
                     self.cpu_temp = int(raw) / 1000.0
@@ -177,101 +324,188 @@ class SysData:
 
     def _mem(self):
         m = psutil.virtual_memory()
-        self.mem_pct   = m.percent
-        self.mem_used  = m.used
+        self.mem_pct = m.percent
+        self.mem_used = m.used
         self.mem_total = m.total
         self.mem_avail = m.available
+        self.mem_cached = m.cached if hasattr(m, 'cached') else 0
+        self.mem_buffers = m.buffers if hasattr(m, 'buffers') else 0
         s = psutil.swap_memory()
-        self.swap_pct  = s.percent
+        self.swap_pct = s.percent
         self.swap_used = s.used
         self.swap_total = s.total
-        self.mem_hist.append(self.mem_pct)
+        self.mem_hist.add(self.mem_pct)
+        self.swap_hist.add(self.swap_pct)
 
     def _net(self):
         now = time.time()
-        c   = psutil.net_io_counters()
-        dt  = max(now - self._p_time, 0.1)
+        c = psutil.net_io_counters()
+        dt = max(now - self._p_time, 0.1)
         self.net_up = (c.bytes_sent - self._p_sent) / dt
         self.net_dn = (c.bytes_recv - self._p_recv) / dt
+        self.net_errs = (c.errin - self._p_errin) + (c.errout - self._p_errout)
         self._p_sent = c.bytes_sent
         self._p_recv = c.bytes_recv
+        self._p_errin = c.errin
+        self._p_errout = c.errout
         self._p_time = now
         self.net_tx_total = c.bytes_sent
         self.net_rx_total = c.bytes_recv
-        # normalise to 125 MB/s (1Gbps) for sparkline scale
-        self.net_up_hist.append(min(self.net_up / 125e6 * 100, 100))
-        self.net_dn_hist.append(min(self.net_dn / 125e6 * 100, 100))
+        # normalise to 125 MB/s (1 Gbps) for sparkline scale
+        self.net_up_hist.add(min(self.net_up / 125e6 * 100, 100))
+        self.net_dn_hist.add(min(self.net_dn / 125e6 * 100, 100))
 
-    def _storage_fast(self):
+    def _disk_io(self):
         try:
-            u = psutil.disk_usage("/")
-            self.root_pct   = u.percent
-            self.root_used  = u.used
-            self.root_total = u.total
+            now = time.time()
+            c = psutil.disk_io_counters()
+            if c:
+                dt = max(now - self._p_disk_time, 0.1)
+                r = (c.read_bytes - self._p_disk_r) / dt
+                w = (c.write_bytes - self._p_disk_w) / dt
+                # Normalise to 500 MB/s for sparkline scale
+                self.disk_r_hist.add(min(r / 500e6 * 100, 100))
+                self.disk_w_hist.add(min(w / 500e6 * 100, 100))
+                self._p_disk_r = c.read_bytes
+                self._p_disk_w = c.write_bytes
+                self._p_disk_time = now
         except Exception:
             pass
 
-    # ── slow (5s) ────────────────────────────────────────────────────────────
+    # ── Slow tick (5s) ─────────────────────────────────────────────────
 
     def tick_slow(self):
-        self._lvm()
-        self._vms()
-        self._snapshots()
+        self._storage()
+        self._zfs()
+        self._vms_aggregate()
+        self._lxcs_aggregate()
         self._net_ips()
+        self._update_alerts()
+        self._check_events()
 
-    def _lvm(self):
-        # Parse lvs for thinpool data%
+    def _storage(self):
+        try:
+            u = psutil.disk_usage("/")
+            self.root_pct = u.percent
+            self.root_used = u.used
+            self.root_total = u.total
+        except Exception:
+            pass
+        # LVM thin pool usage
         out = sh(["lvs", "--noheadings", "-o", "lv_name,data_percent,lv_size",
                   "--units", "g", "pve/data"])
         for line in out.splitlines():
             parts = line.split()
             if parts and parts[0] == "data":
                 try:
-                    self.lvm_pct      = float(parts[1])
+                    self.lvm_pct = float(parts[1])
                     self.lvm_total_gb = float(parts[2].rstrip("g"))
-                    self.lvm_used_gb  = self.lvm_pct / 100 * self.lvm_total_gb
+                    self.lvm_used_gb = self.lvm_pct / 100 * self.lvm_total_gb
                 except Exception:
                     pass
 
-    def _vms(self):
+    def _zfs(self):
+        # ZFS pool list
+        raw = sh(["zpool", "list", "-H", "-o", "name,health,capacity,allocated,size"])
+        pools = []
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) >= 5:
+                pools.append({
+                    "name": parts[0],
+                    "health": parts[1],
+                    "capacity": parts[2],
+                    "used": parts[3],
+                    "total": parts[4],
+                })
+        self.zfs_pools = pools
+        # ARC stats
+        arc = sh(["cat", "/proc/spl/kstat/zfs/arcstats"])
+        for line in arc.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                if "size" == parts[0]:
+                    self.zfs_arc_used = int(parts[2])
+                elif "c_max" == parts[0]:
+                    self.zfs_arc_max = int(parts[2])
+
+    def _vms_aggregate(self):
         data = sh_json(["pvesh", "get", "/nodes/localhost/qemu",
                          "--output-format", "json"])
         if data is None:
-            # fallback: qm list
             raw = sh(["qm", "list"])
-            vms = []
+            # fallback parsing
+            vms_data = []
             for line in raw.splitlines()[1:]:
                 parts = line.split()
                 if len(parts) >= 3:
-                    vms.append({"vmid": int(parts[0]),
-                                "name": parts[1],
-                                "status": parts[2],
-                                "maxmem": 0, "cpus": "?"})
-            self.vms = sorted(vms, key=lambda x: x["vmid"])
-        else:
-            self.vms = sorted(data, key=lambda x: x.get("vmid", 0))
+                    vms_data.append({"vmid": parts[0], "name": parts[1],
+                                     "status": parts[2]})
+            data = vms_data
 
-    def _snapshots(self):
-        snaps = []
-        for vm in self.vms:
-            vmid = vm.get("vmid")
-            if not vmid:
-                continue
-            raw = sh(["qm", "listsnapshot", str(vmid)])
-            for line in raw.splitlines():
-                if "current" in line.lower() or not line.strip():
-                    continue
+        if not data:
+            return
+
+        running = [v for v in data if v.get("status") == "running"]
+        self.vms_running = len(running)
+        self.vms_stopped = len(data) - self.vms_running
+        self.vms_total = len(data)
+
+        if running:
+            self.vm_total_vcpus = sum(v.get("cpus", 0) or 0 for v in running)
+            self.vm_total_maxmem = sum(v.get("maxmem", 0) or 0 for v in running)
+            self.vm_total_mem = sum(v.get("mem", 0) or 0 for v in running)
+            avg_cpu = sum(v.get("cpu", 0) or 0 for v in running) / len(running)
+            self.vm_cpu_pct = avg_cpu * 100
+            if self.vm_total_maxmem > 0:
+                self.vm_mem_pct = self.vm_total_mem / self.vm_total_maxmem * 100
+            self.vm_cpu_hist.add(self.vm_cpu_pct)
+            self.vm_mem_hist.add(self.vm_mem_pct)
+            # Aggregate I/O (newer PVE versions provide these)
+            self.vm_disk_r = sum(v.get("diskread", 0) or 0 for v in running)
+            self.vm_disk_w = sum(v.get("diskwrite", 0) or 0 for v in running)
+            self.vm_net_in = sum(v.get("netin", 0) or 0 for v in running)
+            self.vm_net_out = sum(v.get("netout", 0) or 0 for v in running)
+        else:
+            self.vm_total_vcpus = 0
+            self.vm_total_maxmem = 0
+            self.vm_total_mem = 0
+            self.vm_cpu_pct = 0
+            self.vm_mem_pct = 0
+            self.vm_disk_r = 0
+            self.vm_disk_w = 0
+            self.vm_net_in = 0
+            self.vm_net_out = 0
+
+    def _lxcs_aggregate(self):
+        data = sh_json(["pvesh", "get", "/nodes/localhost/lxc",
+                         "--output-format", "json"])
+        if data is None:
+            raw = sh(["pct", "list"])
+            lxc_data = []
+            for line in raw.splitlines()[1:]:
                 parts = line.split()
-                if parts:
-                    snaps.append({
-                        "vmid": vmid,
-                        "name": parts[0].lstrip("└─ ") if parts else "?",
-                        "vm_name": vm.get("name", str(vmid)),
-                    })
-        self.snapshots = snaps
+                if len(parts) >= 3:
+                    lxc_data.append({"vmid": parts[0], "name": parts[1],
+                                     "status": parts[2]})
+            data = lxc_data
+
+        if not data:
+            return
+
+        running = [c for c in data if c.get("status") == "running"]
+        self.lxc_running = len(running)
+        self.lxc_stopped = len(data) - self.lxc_running
+        self.lxc_total = len(data)
+
+        if running:
+            total_cpu = sum(c.get("cpu", 0) or 0 for c in running)
+            self.lxc_cpu_pct = total_cpu / len(running) * 100
+            total_mem = sum(c.get("mem", 0) or 0 for c in running)
+            total_maxmem = sum(c.get("maxmem", 0) or 0 for c in running)
+            self.lxc_mem_pct = (total_mem / total_maxmem * 100) if total_maxmem else 0
 
     def _net_ips(self):
-        # refresh IPs from ip addr
         out = sh(["ip", "-o", "addr", "show", "vmbr0"])
         m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', out)
         if m:
@@ -281,7 +515,73 @@ class SysData:
         if m2:
             self.ts_ip = m2.group(1)
 
-    # ── helpers ──────────────────────────────────────────────────────────────
+    # ── Alerts ────────────────────────────────────────────────────────
+
+    def _update_alerts(self):
+        alerts = []
+        if self.cpu_pct > 85:
+            alerts.append(Alert("crit", f"CPU {self.cpu_pct:.0f}%"))
+        elif self.cpu_pct > 70:
+            alerts.append(Alert("warn", f"CPU {self.cpu_pct:.0f}%"))
+
+        if self.mem_pct > 85:
+            alerts.append(Alert("crit", f"Memory {self.mem_pct:.0f}%"))
+        elif self.mem_pct > 75:
+            alerts.append(Alert("warn", f"Memory {self.mem_pct:.0f}%"))
+
+        if self.swap_pct > 50:
+            alerts.append(Alert("warn", f"Swap {self.swap_pct:.0f}%"))
+
+        if self.root_pct > 85:
+            alerts.append(Alert("crit", f"Root disk {self.root_pct:.0f}%"))
+        elif self.root_pct > 75:
+            alerts.append(Alert("warn", f"Root disk {self.root_pct:.0f}%"))
+
+        if self.lvm_pct > 85:
+            alerts.append(Alert("crit", f"LVM-thin {self.lvm_pct:.0f}%"))
+        elif self.lvm_pct > 75:
+            alerts.append(Alert("warn", f"LVM-thin {self.lvm_pct:.0f}%"))
+
+        if self.cpu_temp and self.cpu_temp > 80:
+            alerts.append(Alert("warn", f"Temp {self.cpu_temp:.0f}°C"))
+
+        for pool in self.zfs_pools:
+            if pool.get("health") != "ONLINE":
+                alerts.append(Alert("crit", f"ZFS {pool['name']}: {pool['health']}"))
+
+        self.alerts = alerts[:8]  # max 8 alerts shown
+        if not self.alerts:
+            self.alerts = [Alert("ok", "All systems healthy")]
+
+        # Overall status
+        sevs = {a.severity for a in self.alerts}
+        self.overall_status = "crit" if "crit" in sevs else "warn" if "warn" in sevs else "ok"
+
+    # ── Events ────────────────────────────────────────────────────────
+
+    def _check_events(self):
+        # Track VM count changes
+        if self._last_vm_count > 0 and self.vms_running != self._last_vm_count:
+            verb = "up" if self.vms_running > self._last_vm_count else "down"
+            self.events.append(Event(
+                f"VM count changed: {self._last_vm_count} → {self.vms_running} ({verb})",
+                "info"))
+        self._last_vm_count = self.vms_running
+
+        # Track LXC count changes
+        if self._last_lxc_count > 0 and self.lxc_running != self._last_lxc_count:
+            verb = "up" if self.lxc_running > self._last_lxc_count else "down"
+            self.events.append(Event(
+                f"LXC count changed: {self._last_lxc_count} → {self.lxc_running} ({verb})",
+                "info"))
+        self._last_lxc_count = self.lxc_running
+
+        # Check for new alerts
+        for a in self.alerts:
+            if a.severity != "ok":
+                self.events.append(Event(a.message, a.severity))
+
+    # ── Helpers ───────────────────────────────────────────────────────
 
     def uptime_str(self) -> str:
         s = int(self.uptime)
@@ -292,8 +592,12 @@ class SysData:
             return f"{d}d {h:02d}h {m:02d}m"
         return f"{h:02d}h {m:02d}m {s:02d}s"
 
-    def running_vms(self) -> int:
-        return sum(1 for v in self.vms if v.get("status") == "running")
+    def overall_status_dot(self) -> str:
+        col = {"ok": OK, "warn": WARN, "crit": CRIT}[self.overall_status]
+        return f"[{col}]●[/{col}]"
+
+    def overall_status_text(self) -> str:
+        return {"ok": "HEALTHY", "warn": "WARNING", "crit": "CRITICAL"}[self.overall_status]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -301,331 +605,302 @@ class SysData:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HeaderWidget(Static):
-    def __init__(self, d: SysData, **kw):
+    def __init__(self, d: NodeData, **kw):
         super().__init__(**kw)
         self.d = d
 
     def render(self) -> str:
-        now  = datetime.now().strftime("%a %d %b %Y  %H:%M:%S")
-        up   = self.d.uptime_str()
-        host = self.d.hostname.upper()
-        ver  = self.d.pve_ver
+        now = datetime.now().strftime("%a %d %b %Y  %H:%M:%S")
         return (
-            f"[bold #f59e0b] ◈  {host}[/bold #f59e0b]"
-            f"[#3a4a6a]  │  [/#3a4a6a][#7090b0]{ver}[/#7090b0]"
-            f"[#3a4a6a]  │  [/#3a4a6a][#607090]UP {up}[/#607090]"
-            f"[#3a4a6a]  │  [/#3a4a6a][bold white]{now}[/bold white]"
+            f"[bold {AMBER_HI}] ◈  {self.d.hostname.upper()}[/bold {AMBER_HI}]"
+            f"[{DIM2}]  │  [/{DIM2}][{INFO}]{self.d.pve_ver}[/{INFO}]"
+            f"[{DIM2}]  │  [/{DIM2}][{DIM}]UP {self.d.uptime_str()}[/{DIM}]"
+            f"[{DIM2}]  │  [/{DIM2}][bold white]{now}[/bold white]"
+            f"  {self.d.overall_status_dot()} [{pct_color({'ok': 10, 'warn': 50, 'crit': 90}[self.d.overall_status])}]{self.d.overall_status_text()}[/]"
         )
 
 
-class CpuWidget(Static):
-    def __init__(self, d: SysData, **kw):
+class CpuPanel(Static):
+    def __init__(self, d: NodeData, **kw):
         super().__init__(**kw)
         self.d = d
 
     def render(self) -> str:
         d = self.d
-        sp   = spark(d.cpu_hist, 24)
-        bar, col = pct_bar(d.cpu_pct, 22)
-        col  = pct_style(d.cpu_pct)
-        temp = f"[#ef4444]{d.cpu_temp:.0f}°C[/#ef4444]" if d.cpu_temp else "[#607090]──°C[/#607090]"
+        bar = pct_bar(d.cpu_pct, 14)
+        col = pct_color(d.cpu_pct)
+        sp = d.cpu_hist.spark(18)
+        temp = f"[{CRIT}]{d.cpu_temp:.0f}°C[/{CRIT}]" if d.cpu_temp else f"[{DIM}]──°C[/{DIM}]"
         freq = f"{d.cpu_freq/1000:.2f}GHz" if d.cpu_freq else "──GHz"
-        ld   = d.load
+        ld = d.load
+        return "\n".join([
+            f"[bold {AMBER_HI}]▸ CPU[/bold {AMBER_HI}]  [{DIM}]i7-14700  20c/28t[/{DIM}]",
+            f"[{GLYPH}]{'─' * 24}[/{GLYPH}]",
+            f"  {bar} [{col}]{d.cpu_pct:>5.1f}%[/{col}]",
+            f"  [{DIM}]freq[/{DIM}]  [white]{freq}[/white]   [{DIM}]temp[/{DIM}] {temp}",
+            f"  [{DIM}]load[/{DIM}]  {ld[0]:.2f}[{DIM2}]·[/{DIM2}]{ld[1]:.2f}[{DIM2}]·[/{DIM2}]{ld[2]:.2f}",
+            f"  [{DIM}]hist[/{DIM}]  {sp}",
+        ])
 
-        lines = [
-            f"[bold #f59e0b]▸ CPU[/bold #f59e0b]  [#607090]i7-14700  20c/28t[/#607090]",
-            THIN,
-            f"  {bar} [{col}]{d.cpu_pct:5.1f}%[/{col}]",
-            f"  [#607090]spark[/#607090] [#22c55e]{sp}[/#22c55e]",
-            f"  [#607090]freq[/#607090]  [white]{freq}[/white]   [#607090]temp[/#607090] {temp}",
-            f"  [#607090]load[/#607090]  [white]{ld[0]:.2f}[/white][#3a4a6a] · [/#3a4a6a][white]{ld[1]:.2f}[/white][#3a4a6a] · [/#3a4a6a][white]{ld[2]:.2f}[/white]  [#607090]1·5·15m[/#607090]",
+
+class MemPanel(Static):
+    def __init__(self, d: NodeData, **kw):
+        super().__init__(**kw)
+        self.d = d
+
+    def render(self) -> str:
+        d = self.d
+        bar = pct_bar(d.mem_pct, 14)
+        col = pct_color(d.mem_pct)
+        sp = d.mem_hist.spark(18)
+        sbar = pct_bar(d.swap_pct, 14)
+        scol = pct_color(d.swap_pct)
+        used = human(d.mem_used)
+        total = human(d.mem_total)
+        return "\n".join([
+            f"[bold {AMBER_HI}]▸ MEMORY[/bold {AMBER_HI}]  [{DIM}]32 GB DDR5[/{DIM}]",
+            f"[{GLYPH}]{'─' * 24}[/{GLYPH}]",
+            f"  {bar} [{col}]{d.mem_pct:>5.1f}%[/{col}]",
+            f"  [{DIM}]used[/{DIM}] [white]{used}[/white]  [{DIM}]of[/{DIM}] [white]{total}[/white]",
+            f"  [{DIM}]swap[/{DIM}] {sbar} [{scol}]{d.swap_pct:>5.1f}%[/{scol}]",
+            f"  [{DIM}]hist[/{DIM}]  {sp}",
+        ])
+
+
+class PerCorePanel(Static):
+    def __init__(self, d: NodeData, **kw):
+        super().__init__(**kw)
+        self.d = d
+
+    def render(self) -> str:
+        cores = (self.d.cpu_cores or [])[:28]
+        if not cores:
+            return f"[{DIM}]per-core n/a[/{DIM}]"
+        rows = compact_cores(cores, 8)
+        ncols = min(len(cores), 28)
+        return "\n".join([
+            f"[bold {AMBER_HI}]▸ PER-CORE[/bold {AMBER_HI}]  [{DIM}]{ncols} threads[/{DIM}]",
+            f"[{GLYPH}]{'─' * 24}[/{GLYPH}]",
+            *rows,
+        ])
+
+
+class CenterGraphs(Static):
+    """Large central sparkline area — CPU, Mem, Net, Disk."""
+
+    def __init__(self, d: NodeData, **kw):
+        super().__init__(**kw)
+        self.d = d
+
+    def _labeled_spark(self, label: str, hist: History, unit: str,
+                        width: int, color: str = OK) -> list[str]:
+        val = hist.last()
+        raw = hist.spark(width - 2)
+        col = pct_color(val) if isinstance(val, (int, float)) and val <= 100 else color
+        bar = pct_bar(val, 10) if val <= 100 else f"[white]{human(val)}[/white]"
+        return [
+            f"[bold {AMBER_HI}]{label:<6}[/bold {AMBER_HI}]"
+            f"[{col}]{bar:>12}[/{col}]  "
+            f"[white]{val if isinstance(val, (int, float)) else 0:>6.1f}[/white]"
+            f"[{DIM}] {unit}[/{DIM}]",
+            f"  {raw}",
         ]
 
-        # Per-core grid — 28 logical CPUs in 4 rows of 7
-        cores = (d.cpu_cores or [])[:28]
-        MINI = " ▂▄▅▆▇█"
-        rows_txt = []
-        row_size = 7
-        for r in range(0, len(cores), row_size):
-            chunk = cores[r:r+row_size]
-            row = "  "
-            for c in chunk:
-                col2 = pct_style(c)
-                row += f"[{col2}]{MINI[min(int(c/100*6),6)]}[/{col2}]"
-            rows_txt.append(row)
+    def render(self) -> str:
+        d = self.d
+        # Calculate dynamic width from terminal
+        # Textual doesn't expose width easily in render(), so use fixed
+        w = 100
+        lines = []
+        lines += self._labeled_spark("CPU", d.cpu_hist, "%", w)
+        lines.append("")
+        lines += self._labeled_spark("MEM", d.mem_hist, "%", w)
+        lines.append("")
 
-        lines += rows_txt
+        # Network: dual sparkline
+        up_val = d.net_up_hist.last()
+        dn_val = d.net_dn_hist.last()
+        up_s = human(d.net_up)
+        dn_s = human(d.net_dn)
+        lines.append(
+            f"[bold {AMBER_HI}]NETW  [/bold {AMBER_HI}]"
+            f"  [bold {OK}]▲[/bold {OK}] [white]{up_s:>9}/s[/white]"
+            f"  [bold {INFO}]▼[/bold {INFO}] [white]{dn_s:>9}/s[/white]"
+        )
+        lines.append(f"  [{OK}]{d.net_up_hist.spark(w)}[/{OK}]")
+        lines.append(f"  [{INFO}]{d.net_dn_hist.spark(w)}[/{INFO}]")
+        lines.append("")
+
+        # Disk: dual sparkline
+        dr_val = d.disk_r_hist.last()
+        dw_val = d.disk_w_hist.last()
+        lines.append(
+            f"[bold {AMBER_HI}]DISK  [/bold {AMBER_HI}]"
+            f"  [{OK}]R[/{OK}] [white]{human(d.disk_r_hist.last() * 5e6) if d.disk_r_hist.last() else '  0.0 B '}/s[/white]"
+            f"  [{INFO}]W[/{INFO}] [white]{human(d.disk_w_hist.last() * 5e6) if d.disk_w_hist.last() else '  0.0 B '}/s[/white]"
+        )
+        lines.append(f"  [{OK}]{d.disk_r_hist.spark(w)}[/{OK}]")
+        lines.append(f"  [{INFO}]{d.disk_w_hist.spark(w)}[/{INFO}]")
+
         return "\n".join(lines)
 
 
-class MemWidget(Static):
-    def __init__(self, d: SysData, **kw):
+class VmSummaryPanel(Static):
+    def __init__(self, d: NodeData, **kw):
         super().__init__(**kw)
         self.d = d
 
     def render(self) -> str:
         d = self.d
-        sp        = spark(d.mem_hist, 24)
-        bar_r, _  = pct_bar(d.mem_pct,  22)
-        bar_s, _  = pct_bar(d.swap_pct, 22)
-        col_r     = pct_style(d.mem_pct)
-        col_s     = pct_style(d.swap_pct)
-        used_h    = human(d.mem_used).strip()
-        total_h   = human(d.mem_total).strip()
-        avail_h   = human(d.mem_avail).strip()
-        su_h      = human(d.swap_used).strip()
-        st_h      = human(d.swap_total).strip()
-
+        vm_cpu_sp = d.vm_cpu_hist.spark(14)
+        vm_mem_sp = d.vm_mem_hist.spark(14)
+        vm_run_col = OK if d.vms_running > 0 else DIM
+        lxc_run_col = OK if d.lxc_running > 0 else DIM
         return "\n".join([
-            f"[bold #f59e0b]▸ MEMORY[/bold #f59e0b]  [#607090]32 GB DDR5[/#607090]",
-            THIN,
-            f"  [#607090]ram [/#607090]{bar_r} [{col_r}]{d.mem_pct:5.1f}%[/{col_r}]",
-            f"  [#607090]     [/#607090][white]{used_h}[/white][#3a4a6a] used · [/#3a4a6a][white]{avail_h}[/white][#3a4a6a] free · [/#3a4a6a][#607090]{total_h} total[/#607090]",
-            f"  [#607090]swap[/#607090]{bar_s} [{col_s}]{d.swap_pct:5.1f}%[/{col_s}]",
-            f"  [#607090]     [/#607090][white]{su_h}[/white][#3a4a6a] used · [/#3a4a6a][#607090]{st_h} total[/#607090]",
-            f"  [#607090]hist[/#607090] [#22c55e]{sp}[/#22c55e]",
+            f"[bold {AMBER_HI}]▸ VIRTUALIZATION[/bold {AMBER_HI}]",
+            f"[{GLYPH}]{'─' * 24}[/{GLYPH}]",
+            f"  [{vm_run_col}]▶[/{vm_run_col}] [white]VMs[/white]    [{vm_run_col}]{d.vms_running} running[/{vm_run_col}]"
+            f"[{DIM2}] / [/{DIM2}][{DIM}]{d.vms_stopped} stopped[/{DIM}]  [{DIM}]{d.vms_total} total[/{DIM}]",
+            f"  [{lxc_run_col}]▶[/{lxc_run_col}] [white]LXCs[/white]   [{lxc_run_col}]{d.lxc_running} running[/{lxc_run_col}]"
+            f"[{DIM2}] / [/{DIM2}][{DIM}]{d.lxc_stopped} stopped[/{DIM}]  [{DIM}]{d.lxc_total} total[/{DIM}]",
+            f"",
+            f"  [{DIM}]vCPUs[/{DIM}]    [white]{d.vm_total_vcpus:>4}[/white]  [{DIM}]allocated[/{DIM}]",
+            f"  [{DIM}]RAM[/{DIM}]     [white]{human_int(d.vm_total_maxmem):>9}[/white]  [{DIM}]allocated[/{DIM}]",
+            f"  [{DIM}]CPU[/{DIM}]     [{pct_color(d.vm_cpu_pct)}]{d.vm_cpu_pct:>5.1f}%[/]  {vm_cpu_sp}",
+            f"  [{DIM}]MEM[/{DIM}]     [{pct_color(d.vm_mem_pct)}]{d.vm_mem_pct:>5.1f}%[/]  {vm_mem_sp}",
         ])
 
 
-class VmWidget(Static):
-    def __init__(self, d: SysData, **kw):
-        super().__init__(**kw)
-        self.d = d
-
-    def render(self) -> str:
-        d     = self.d
-        total = len(d.vms)
-        run   = d.running_vms()
-        stop  = total - run
-
-        lines = [
-            f"[bold #f59e0b]▸ VIRTUAL MACHINES[/bold #f59e0b]  "
-            f"[#22c55e]{run} running[/#22c55e][#3a4a6a] · [/#3a4a6a][#607090]{stop} stopped[/#607090]",
-            THIN,
-        ]
-
-        VM_NAMES = {
-            100: "Main-VM",
-            101: "coding-platform",
-            102: "staging-vm",
-            104: "104",
-            106: "db-backup",
-        }
-
-        for vm in d.vms[:8]:
-            vmid   = vm.get("vmid", "?")
-            name   = (vm.get("name") or VM_NAMES.get(vmid) or f"vm-{vmid}")[:18]
-            status = vm.get("status", "?")
-            if status == "running":
-                icon  = "[#22c55e]▶[/#22c55e]"
-                scol  = "#22c55e"
-            else:
-                icon  = "[#ef4444]■[/#ef4444]"
-                scol  = "#607090"
-
-            maxmem = vm.get("maxmem", 0)
-            mem_s  = human(maxmem).strip() if maxmem else "    ─"
-            cpus   = vm.get("cpus", "─")
-
-            lines.append(
-                f"  {icon} [bold white]{vmid:>3}[/bold white]"
-                f"  [{scol}]{name:<18}[/{scol}]"
-                f"  [#607090]cpu[/#607090][white]{cpus}[/white]"
-                f"  [#607090]mem[/#607090][white]{mem_s}[/white]"
-            )
-
-        return "\n".join(lines)
-
-
-class NetworkWidget(Static):
-    def __init__(self, d: SysData, **kw):
-        super().__init__(**kw)
-        self.d = d
-
-    def render(self) -> str:
-        d      = self.d
-        sp_up  = spark(d.net_up_hist, 20)
-        sp_dn  = spark(d.net_dn_hist, 20)
-        up_s   = human(d.net_up).strip()
-        dn_s   = human(d.net_dn).strip()
-        tx_s   = human(d.net_tx_total).strip()
-        rx_s   = human(d.net_rx_total).strip()
-
-        return "\n".join([
-            f"[bold #f59e0b]▸ NETWORK[/bold #f59e0b]",
-            THIN,
-            f"  [bold #22c55e]▲[/bold #22c55e] [white]{up_s:>12}/s[/white]  [#22c55e]{sp_up}[/#22c55e]",
-            f"  [bold #38bdf8]▼[/bold #38bdf8] [white]{dn_s:>12}/s[/white]  [#38bdf8]{sp_dn}[/#38bdf8]",
-            f"  [#607090]TX[/#607090] [white]{tx_s:>12}[/white]  [#607090]total sent[/#607090]",
-            f"  [#607090]RX[/#607090] [white]{rx_s:>12}[/white]  [#607090]total recv[/#607090]",
-            THIN,
-            f"  [#607090]vmbr0     [/#607090][white]{d.node_ip:<18}[/white][#607090]1 Gb[/#607090]",
-            f"  [#607090]tailscale [/#607090][#a855f7]{d.ts_ip:<18}[/#a855f7][#607090]VPN[/#607090]",
-        ])
-
-
-class StorageWidget(Static):
-    def __init__(self, d: SysData, **kw):
-        super().__init__(**kw)
-        self.d = d
-
-    def render(self) -> str:
-        d = self.d
-        bar_r, _ = pct_bar(d.root_pct, 20)
-        bar_l, _ = pct_bar(d.lvm_pct, 20)
-        cr = pct_style(d.root_pct)
-        cl = pct_style(d.lvm_pct)
-        r_used  = human(d.root_used).strip()
-        r_total = human(d.root_total).strip()
-        l_used  = f"{d.lvm_used_gb:.1f}GB" if d.lvm_used_gb else "─"
-        l_total = f"{d.lvm_total_gb:.1f}GB" if d.lvm_total_gb else "─"
-
-        return "\n".join([
-            f"[bold #f59e0b]▸ STORAGE[/bold #f59e0b]  [#607090]SK Hynix NVMe 1TB[/#607090]",
-            THIN,
-            f"  [#607090]root  [/#607090]{bar_r} [{cr}]{d.root_pct:5.1f}%[/{cr}]",
-            f"  [#607090]ext4  [/#607090][white]{r_used}[/white][#3a4a6a] / [/#3a4a6a][#607090]{r_total}[/#607090]",
-            THIN,
-            f"  [#607090]data  [/#607090]{bar_l} [{cl}]{d.lvm_pct:5.1f}%[/{cl}]",
-            f"  [#607090]thin  [/#607090][white]{l_used}[/white][#3a4a6a] / [/#3a4a6a][#607090]{l_total}[/#607090]",
-            f"  [#607090]pool  [/#607090][white]pve/data[/white][#3a4a6a] · [/#3a4a6a][#607090]LVM-thin[/#607090]",
-        ])
-
-
-class SnapshotWidget(Static):
-    def __init__(self, d: SysData, **kw):
+class StoragePanel(Static):
+    def __init__(self, d: NodeData, **kw):
         super().__init__(**kw)
         self.d = d
 
     def render(self) -> str:
         d = self.d
         lines = [
-            f"[bold #f59e0b]▸ SNAPSHOTS[/bold #f59e0b]  [#607090]{len(d.snapshots)} total[/#607090]",
-            THIN,
+            f"[bold {AMBER_HI}]▸ STORAGE[/bold {AMBER_HI}]",
+            f"[{GLYPH}]{'─' * 24}[/{GLYPH}]",
+            f"  [{DIM}]root[/{DIM}]  {pct_bar(d.root_pct, 12)} [{pct_color(d.root_pct)}]{d.root_pct:.1f}%[/]",
+            f"  [{DIM}]ext4[/{DIM}]  [white]{human(d.root_used)}[/] [{DIM2}]/[/{DIM2}] [{DIM}]{human(d.root_total)}[/{DIM}]",
         ]
-        if not d.snapshots:
-            lines.append("  [#607090]no snapshots found[/#607090]")
-        else:
-            for sn in d.snapshots[:6]:
+        if d.lvm_pct:
+            lines += [
+                f"  [{DIM}]data[/{DIM}]  {pct_bar(d.lvm_pct, 12)} [{pct_color(d.lvm_pct)}]{d.lvm_pct:.1f}%[/]",
+                f"  [{DIM}]thin[/{DIM}]  [white]{d.lvm_used_gb:.1f}G[/] [{DIM2}]/[/{DIM2}] [{DIM}]{d.lvm_total_gb:.0f}G[/{DIM}]",
+            ]
+        # ZFS pools
+        if d.zfs_pools:
+            lines.append("")
+            for pool in d.zfs_pools[:2]:
+                hcol = OK if pool["health"] == "ONLINE" else CRIT
                 lines.append(
-                    f"  [#a855f7]◉[/#a855f7]  [white]VM {sn['vmid']}[/white]"
-                    f"  [#607090]{sn['vm_name'][:12]:<12}[/#607090]"
-                    f"  [#f59e0b]{sn['name'][:18]}[/#f59e0b]"
+                    f"  [{hcol}]◈[/{hcol}] [{DIM}]{pool['name']:<10}[/{DIM}]"
+                    f"[{hcol}]{pool['health']:<8}[/{hcol}]"
+                    f"[white]{pool['capacity']:>3}%[/white]"
+                )
+            if d.zfs_arc_max:
+                arc_pct = d.zfs_arc_used / d.zfs_arc_max * 100 if d.zfs_arc_max else 0
+                lines.append(
+                    f"  [{DIM}]ARC[/{DIM}]   {pct_bar(arc_pct, 8)} [{pct_color(arc_pct)}]{arc_pct:.0f}%[/]"
+                    f"  [{DIM}]{human_int(d.zfs_arc_used)}[/{DIM}]"
                 )
         return "\n".join(lines)
 
 
-class CentreWidget(Static):
-    """Identity centrepiece — TCET COE branding with warning."""
-
-    def __init__(self, d: SysData, **kw):
+class NetworkPanel(Static):
+    def __init__(self, d: NodeData, **kw):
         super().__init__(**kw)
         self.d = d
-        self._tick = 0
 
     def render(self) -> str:
-        self._tick += 1
-        # pulse the outer glow char between two shades
-        amber_hi = "#f59e0b"
-        amber_lo = "#92600a"
-        glow     = amber_hi if self._tick % 2 == 0 else amber_lo
+        d = self.d
+        up_s = human(d.net_up)
+        dn_s = human(d.net_dn)
+        tx_s = human_int(d.net_tx_total)
+        rx_s = human_int(d.net_rx_total)
+        err_col = CRIT if d.net_errs > 0 else DIM
+        net_up_sp = d.net_up_hist.spark(14)
+        net_dn_sp = d.net_dn_hist.spark(14)
+        return "\n".join([
+            f"[bold {AMBER_HI}]▸ NETWORK[/bold {AMBER_HI}]",
+            f"[{GLYPH}]{'─' * 24}[/{GLYPH}]",
+            f"  [bold {OK}]▲[/bold {OK}] [white]{up_s:>9}/s[/white]  [{OK}]{net_up_sp}[/{OK}]",
+            f"  [bold {INFO}]▼[/bold {INFO}] [white]{dn_s:>9}/s[/white]  [{INFO}]{net_dn_sp}[/{INFO}]",
+            f"  [{DIM}]TX[/{DIM}] [white]{tx_s:>10}[/white]  [{DIM}]total[/{DIM}]",
+            f"  [{DIM}]RX[/{DIM}] [white]{rx_s:>10}[/white]  [{DIM}]total[/{DIM}]",
+            f"  [{DIM}]err[/{DIM}] [{err_col}]{d.net_errs:>9}[/{err_col}]  [{DIM}]pkts[/{DIM}]",
+            f"[{GLYPH}]{'─' * 24}[/{GLYPH}]",
+            f"  [{DIM}]vmbr0    [/{DIM}][white]{d.node_ip:<14}[/white][{DIM}]1G[/{DIM}]",
+            f"  [{DIM}]tscale   [/{DIM}][#a855f7]{d.ts_ip:<14}[/#a855f7][{DIM}]VPN[/{DIM}]" if d.ts_ip else "",
+        ])
 
-        d   = self.d
-        run = d.running_vms()
-        tot = len(d.vms)
 
-        # live status line inside the seal
-        if run == tot and tot > 0:
-            status_col = "#22c55e"
-            status_txt = f"ALL {tot} VMs OPERATIONAL"
-        elif run == 0:
-            status_col = "#ef4444"
-            status_txt = "ALL VMs OFFLINE"
-        else:
-            status_col = "#f59e0b"
-            status_txt = f"{run}/{tot} VMs RUNNING"
+class AlertsPanel(Static):
+    def __init__(self, d: NodeData, **kw):
+        super().__init__(**kw)
+        self.d = d
 
-        ip = d.node_ip
-
-        L = "[" + glow + "]"
-        R = "[/" + glow + "]"
-        # box width = 44 inner chars
-        W = 44
-
-        def centre(text: str, width: int = W) -> str:
-            # strip Rich markup for length calc
-            plain = re.sub(r'\[[^\]]+\]', '', text)
-            pad   = max(0, width - len(plain))
-            lp    = pad // 2
-            rp    = pad - lp
-            return " " * lp + text + " " * rp
-
-        border_h  = "═" * W
-        border_top    = f"{L}╔{border_h}╗{R}"
-        border_bot    = f"{L}╚{border_h}╝{R}"
-        side          = lambda inner: f"{L}║{R}{inner}{L}║{R}"
-
-        blank  = side(" " * W)
-
-        # row contents (44 wide)
-        r_label = centre(f"[bold #607090]T C E T[/bold #607090]")
-        r_sub1  = centre(f"[#3a5a8a]Centre of Excellence[/#3a5a8a]")
-        r_rule  = centre(f"[{amber_lo}]{'─' * 30}[/{amber_lo}]")
-        r_title = centre(f"[bold white]P R O X M O X   1[/bold white]")
-        r_node  = centre(f"[#607090]node · {ip}[/#607090]")
-        r_blank2 = centre("")
-        r_status = centre(f"[bold {status_col}]{status_txt}[/bold {status_col}]")
-
-        # Warning — small, tracked, understated
-        r_warn_a = centre(f"[dim #8a6a20]{'·' * 34}[/dim #8a6a20]")
-        r_warn_b = centre(f"[dim #a07828]⚠  AUTHORISED ACCESS ONLY  ⚠[/dim #a07828]")
-        r_warn_c = centre(f"[dim #607050]DO NOT POWER OFF OR MODIFY[/dim #607050]")
-        r_warn_d = centre(f"[dim #607050]WITHOUT APPROVAL FROM COE ADMIN[/dim #607050]")
-        r_warn_e = centre(f"[dim #8a6a20]{'·' * 34}[/dim #8a6a20]")
-
-        rows = [
-            border_top,
-            blank,
-            side(r_label),
-            side(r_sub1),
-            side(r_rule),
-            side(r_title),
-            side(r_node),
-            side(r_blank2),
-            side(r_status),
-            blank,
-            side(r_warn_a),
-            side(r_warn_b),
-            side(r_warn_c),
-            side(r_warn_d),
-            side(r_warn_e),
-            blank,
-            border_bot,
+    def render(self) -> str:
+        d = self.d
+        lines = [
+            f"[bold {AMBER_HI}]▸ ALERTS[/bold {AMBER_HI}]",
+            f"[{GLYPH}]{'─' * 24}[/{GLYPH}]",
         ]
+        for a in d.alerts[:6]:
+            if a.severity == "ok":
+                icon = "[#22c55e]✓[/#22c55e]"
+                col = OK
+            elif a.severity == "warn":
+                icon = "[#f59e0b]⚡[/#f59e0b]"
+                col = WARN
+            else:
+                icon = "[#ef4444]●[/#ef4444]"
+                col = CRIT
+            lines.append(f"  {icon} [{col}]{a.message:<22}[/{col}]")
+        return "\n".join(lines)
 
-        return "\n".join(rows)
+
+class ActivityPanel(Static):
+    def __init__(self, d: NodeData, **kw):
+        super().__init__(**kw)
+        self.d = d
+
+    def render(self) -> str:
+        d = self.d
+        lines = [
+            f"[bold {AMBER_HI}]▸ RECENT[/bold {AMBER_HI}]",
+            f"[{GLYPH}]{'─' * 24}[/{GLYPH}]",
+        ]
+        evts = list(d.events)
+        if not evts:
+            lines.append(f"  [{DIM}]no recent events[/{DIM}]")
+        else:
+            for ev in evts[-10:]:
+                col = {"ok": OK, "warn": WARN, "info": INFO, "crit": CRIT}.get(ev.kind, DIM)
+                lines.append(
+                    f"  [{DIM}]{ev.time}[/{DIM}] [{col}]{ev.message[:24]:<24}[/{col}]"
+                )
+        return "\n".join(lines)
 
 
 class FooterWidget(Static):
-    def __init__(self, d: SysData, **kw):
+    def __init__(self, d: NodeData, **kw):
         super().__init__(**kw)
         self.d = d
-        self._t = 0
 
     def render(self) -> str:
-        self._t += 1
-        d   = self.d
-        run = d.running_vms()
-        tot = len(d.vms)
-        k   = d.kernel[:32] if d.kernel else "─"
+        d = self.d
+        k = d.kernel[:28] if d.kernel else "─"
         return (
-            f"[#607090] kernel[/#607090] [white]{k}[/white]"
-            f"  [#3a4a6a]│[/#3a4a6a]  [#607090]vms[/#607090] [#22c55e]{run}[/#22c55e][#3a4a6a]/[/#3a4a6a][white]{tot}[/white]"
-            f"  [#3a4a6a]│[/#3a4a6a]  [#607090]root[/#607090] [white]{d.root_pct:.0f}%[/white]"
-            f"  [#3a4a6a]│[/#3a4a6a]  [#607090]lvm-thin[/#607090] [white]{d.lvm_pct:.1f}%[/white]"
-            f"  [#3a4a6a]│[/#3a4a6a]  [#607090]mem[/#607090] [white]{d.mem_pct:.0f}%[/white]"
-            f"  [#3a4a6a]│[/#3a4a6a]  [#607090]cpu[/#607090] [white]{d.cpu_pct:.0f}%[/white]"
-            f"  [#3a4a6a]│[/#3a4a6a]  [dim #607090]tick #{self._t}  ·  1s refresh[/dim #607090]"
+            f"[{DIM}] kernel[/{DIM}] [white]{k:<28}[/white]"
+            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]cpu[/{DIM}] [{pct_color(d.cpu_pct)}]{d.cpu_pct:.0f}%[/]"
+            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]mem[/{DIM}] [{pct_color(d.mem_pct)}]{d.mem_pct:.0f}%[/]"
+            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]vms[/{DIM}] [{OK}]{d.vms_running}[/{OK}][{DIM2}]/[/{DIM2}][white]{d.vms_total}[/white]"
+            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]lxc[/{DIM}] [{OK}]{d.lxc_running}[/{OK}][{DIM2}]/[/{DIM2}][white]{d.lxc_total}[/white]"
+            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]root[/{DIM}] [{pct_color(d.root_pct)}]{d.root_pct:.0f}%[/]"
+            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]swap[/{DIM}] [{pct_color(d.swap_pct)}]{d.swap_pct:.0f}%[/]"
+            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]tick #[/{DIM}][white]{d.tick_n}[/white]"
         )
 
 
@@ -633,7 +908,7 @@ class FooterWidget(Static):
 #  APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TCETDashboard(App):
+class OperationsDashboard(App):
     CSS = """
     Screen {
         background: #0a0e1a;
@@ -662,15 +937,15 @@ class TCETDashboard(App):
         layout: horizontal;
     }
 
-    /* ── Left column ── */
+    /* ── Left column: system metrics ── */
     #left {
-        width: 26;
+        width: 28;
         layout: vertical;
         border-right: tall #1e2a3a;
     }
 
     #cpu-pane {
-        height: 1fr;
+        height: auto;
         padding: 1 1;
         border-bottom: tall #1e2a3a;
     }
@@ -681,35 +956,31 @@ class TCETDashboard(App):
         border-bottom: tall #1e2a3a;
     }
 
-    #vm-pane {
+    #percore-pane {
         height: 1fr;
         padding: 1 1;
     }
 
-    /* ── Centre column ── */
+    /* ── Centre column: history graphs ── */
     #centre {
         width: 1fr;
         layout: vertical;
-        align: center middle;
-        content-align: center middle;
-        padding: 0 2;
+        padding: 1 2;
     }
 
-    #centre-widget {
-        width: auto;
-        height: auto;
+    #graphs-pane {
+        height: 1fr;
         content-align: center middle;
-        align: center middle;
     }
 
-    /* ── Right column ── */
+    /* ── Right column: VM summary, storage, alerts, activity ── */
     #right {
         width: 28;
         layout: vertical;
         border-left: tall #1e2a3a;
     }
 
-    #net-pane {
+    #vm-pane {
         height: auto;
         padding: 1 1;
         border-bottom: tall #1e2a3a;
@@ -721,20 +992,31 @@ class TCETDashboard(App):
         border-bottom: tall #1e2a3a;
     }
 
-    #snap-pane {
+    #net-pane {
+        height: auto;
+        padding: 1 1;
+        border-bottom: tall #1e2a3a;
+    }
+
+    #alerts-pane {
+        height: auto;
+        padding: 1 1;
+        border-bottom: tall #1e2a3a;
+    }
+
+    #activity-pane {
         height: 1fr;
         padding: 1 1;
     }
     """
 
-    TITLE = "TCET COE · Proxmox 1"
+    TITLE = "TCET COE · Proxmox 1 NOC Dashboard"
     BINDINGS = [("ctrl+c", "quit", "Quit")]
 
     def __init__(self):
         super().__init__()
-        self.d = SysData()
+        self.d = NodeData()
         self._slow = 0
-        # prime data
         self.d.tick_fast()
         self.d.tick_slow()
 
@@ -742,15 +1024,17 @@ class TCETDashboard(App):
         yield HeaderWidget(self.d, id="header")
         with Horizontal(id="body"):
             with Vertical(id="left"):
-                yield CpuWidget(self.d, id="cpu-pane")
-                yield MemWidget(self.d, id="mem-pane")
-                yield VmWidget(self.d, id="vm-pane")
+                yield CpuPanel(self.d, id="cpu-pane")
+                yield MemPanel(self.d, id="mem-pane")
+                yield PerCorePanel(self.d, id="percore-pane")
             with Vertical(id="centre"):
-                yield CentreWidget(self.d, id="centre-widget")
+                yield CenterGraphs(self.d, id="graphs-pane")
             with Vertical(id="right"):
-                yield NetworkWidget(self.d, id="net-pane")
-                yield StorageWidget(self.d, id="storage-pane")
-                yield SnapshotWidget(self.d, id="snap-pane")
+                yield VmSummaryPanel(self.d, id="vm-pane")
+                yield StoragePanel(self.d, id="storage-pane")
+                yield NetworkPanel(self.d, id="net-pane")
+                yield AlertsPanel(self.d, id="alerts-pane")
+                yield ActivityPanel(self.d, id="activity-pane")
         yield FooterWidget(self.d, id="footer")
 
     def on_mount(self) -> None:
@@ -761,14 +1045,18 @@ class TCETDashboard(App):
         self._slow += 1
         if self._slow % 5 == 0:
             self.d.tick_slow()
-        for wid in ("header", "cpu-pane", "mem-pane", "vm-pane",
-                    "centre-widget", "net-pane", "storage-pane",
-                    "snap-pane", "footer"):
+        for wid in ("header", "cpu-pane", "mem-pane", "percore-pane",
+                     "graphs-pane", "vm-pane", "storage-pane", "net-pane",
+                     "alerts-pane", "activity-pane", "footer"):
             try:
                 self.query_one(f"#{wid}").refresh()
             except Exception:
                 pass
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TTY CLAIM + ENTRY
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _claim_tty() -> bool:
     """Fork + setsid to make /dev/tty1 the controlling terminal.
@@ -788,10 +1076,8 @@ def _claim_tty() -> bool:
                 os.kill(pid, signum)
             except OSError:
                 pass
-
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, _forward)
-
         try:
             os.waitpid(pid, 0)
         except ChildProcessError:
@@ -799,7 +1085,6 @@ def _claim_tty() -> bool:
         os._exit(0)
 
     os.setsid()
-
     for dev in ("/dev/tty1", "/dev/tty"):
         try:
             fd = os.open(dev, os.O_RDWR)
@@ -817,8 +1102,7 @@ def _claim_tty() -> bool:
 
 def main():
     _claim_tty()
-    app = TCETDashboard()
-    app.run()
+    OperationsDashboard().run()
 
 
 if __name__ == "__main__":
