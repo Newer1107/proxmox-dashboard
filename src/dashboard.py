@@ -753,7 +753,7 @@ class GraphArea(Static):
         mn = f"{min(vals):.1f}" if vals else "─"
         mx = f"{max(vals):.1f}" if vals else "─"
         lines = [
-            f"  [{colour}]━━━[/{colour}] [bold {colour}]{title}[/bold]  {val_s}"
+            f"  [{colour}]━━━[/{colour}] [bold {colour}]{title}[/]  {val_s}"
             f"[{DIM}]     min[/{DIM}] [white]{mn}[/white][{DIM}]  max[/{DIM}] [white]{mx}[/white]"
             f"  {extra}",
             f"  {sp}",
