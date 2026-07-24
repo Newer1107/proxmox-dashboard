@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Proxmox Node Dashboard — Premium Appliance Operations View
-Centered status panel, symmetric cards, large live graphs.
+Proxmox Node Dashboard — Premium Appliance Operations View (v2)
+Bordered, titled cards · dynamic-width graphs · real 0-100 scaled sparklines.
 """
 
 from __future__ import annotations
@@ -9,9 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
-import signal
 import subprocess
-import sys
 import time
 from collections import deque
 from datetime import datetime
@@ -27,21 +25,27 @@ from textual.widgets import Static
 #  DESIGN TOKENS
 # ══════════════════════════════════════════════════════════════════════════════
 
-OK    = "#22c55e"
-WARN  = "#f59e0b"
-CRIT  = "#ef4444"
-INFO  = "#38bdf8"
-PURPLE= "#a855f7"
-DIM   = "#607090"
-DIM2  = "#3a4a6a"
-GOLD  = "#f59e0b"
-GLYPH = "#2a3a5a"
-BG    = "#0a0e1a"
-BG2   = "#0d1220"
-BDR   = "#1e2a3a"
-WHITE = "#c0cce0"
+OK      = "#34d399"
+WARN    = "#fbbf24"
+CRIT    = "#f87171"
+INFO    = "#38bdf8"
+PURPLE  = "#a78bfa"
+TEAL    = "#2dd4bf"
+ORANGE  = "#fb923c"
+GOLD    = "#f5b942"
+DIM     = "#6b7a99"
+DIM2    = "#39476b"
+WHITE   = "#dbe3f3"
+
+BG        = "#090c15"
+PANEL_BG  = "#0e1524"
+CARD_BG   = "#111a2c"
+BORDER    = "#25324d"
 
 BLOCKS = " ▁▂▃▄▅▆▇█"
+
+ORG_NAME = "T C E T"
+ORG_SUB  = "Centre of Excellence"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -90,16 +94,17 @@ def pct_bar(pct: float, width: int = 10) -> str:
     filled = max(0, min(int(pct / 100 * width), width))
     empty = width - filled
     col = pct_color(pct)
-    return f"[{col}]{'█' * filled}{'░' * empty}[/{col}]"
+    return f"[{col}]{'█' * filled}[/{col}][{DIM2}]{'─' * empty}[/{DIM2}]"
 
 
-def spark_wide(vals: list[float], width: int) -> str:
-    """Resampled sparkline that fills exactly *width* chars."""
+def spark_wide(vals: list[float], width: int, colour: Optional[str] = None) -> str:
+    """Sparkline resampled to *width* chars, fixed 0-100 scale (all stored
+    histories are already percentages) so flat/idle data still reads as a
+    real baseline instead of collapsing into blank space."""
+    width = max(1, width)
     if not vals:
-        return f"[{DIM}]{'─' * width}[/{DIM}]"
+        return f"[{DIM2}]{'▁' * width}[/{DIM2}]"
     n = len(vals)
-    lo, hi = min(vals), max(vals)
-    span = hi - lo or 1
     chars = []
     for i in range(width):
         idx = i / (width - 1) * (n - 1) if width > 1 else 0
@@ -107,11 +112,13 @@ def spark_wide(vals: list[float], width: int) -> str:
         right = min(left + 1, n - 1)
         frac = idx - left
         v = vals[left] * (1 - frac) + vals[right] * frac
-        chars.append(BLOCKS[min(int((v - lo) / span * 8), 8)])
-    # Color based on latest value
-    col = pct_color(vals[-1])
+        v = max(0.0, min(100.0, v))
+        level = int(v / 100 * 8)
+        if v > 0.5 and level == 0:
+            level = 1
+        chars.append(BLOCKS[level])
+    col = colour or pct_color(vals[-1])
     return f"[{col}]{''.join(chars)}[/{col}]"
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -140,7 +147,7 @@ class History:
 
 class Alert:
     def __init__(self, severity: str, message: str):
-        self.severity = severity  # ok | warn | crit
+        self.severity = severity
         self.message = message
         self.time = datetime.now().strftime("%H:%M")
 
@@ -148,7 +155,7 @@ class Alert:
 class Event:
     def __init__(self, message: str, kind: str = "info"):
         self.message = message
-        self.kind = kind  # ok | warn | info | crit
+        self.kind = kind
         self.time = datetime.now().strftime("%H:%M")
 
 
@@ -160,15 +167,14 @@ class NodeData:
     """Aggregated node data — fast (1 s) and slow (5 s) ticks."""
 
     def __init__(self):
-        # CPU
         self.cpu_pct: float = 0.0
         self.cpu_cores: list[float] = []
         self.cpu_freq: float = 0.0
+        self.cpu_model: str = ""
         self.cpu_temp: Optional[float] = None
         self.load: tuple = (0.0, 0.0, 0.0)
         self.cpu_hist = History()
 
-        # Memory
         self.mem_pct: float = 0.0
         self.mem_used: int = 0
         self.mem_total: int = 0
@@ -178,7 +184,6 @@ class NodeData:
         self.swap_total: int = 0
         self.mem_hist = History()
 
-        # Network
         self.net_up: float = 0.0
         self.net_dn: float = 0.0
         self.net_tx_total: int = 0
@@ -189,16 +194,13 @@ class NodeData:
         self._p_recv = 0
         self._p_time = time.time()
 
-        # Disk I/O
         self.disk_r_hist = History()
         self.disk_w_hist = History()
         self._p_disk_r = 0
         self._p_disk_w = 0
         self._p_disk_time = time.time()
-        # Normalisation ceiling
         self._disk_ceil = 500e6
 
-        # Storage
         self.root_pct: float = 0.0
         self.root_used: int = 0
         self.root_total: int = 0
@@ -206,12 +208,10 @@ class NodeData:
         self.lvm_used_gb: float = 0.0
         self.lvm_total_gb: float = 0.0
 
-        # ZFS
         self.zfs_pools: list[dict] = []
         self.zfs_arc_size: int = 0
         self.zfs_arc_max: int = 0
 
-        # Virtualisation (aggregated, no individual names)
         self.vms_running: int = 0
         self.vms_stopped: int = 0
         self.vms_total: int = 0
@@ -226,7 +226,6 @@ class NodeData:
         self.vm_cpu_hist = History()
         self.vm_mem_hist = History()
 
-        # System
         self.uptime: float = 0.0
         self.hostname: str = sh(["hostname"]) or "proxmox"
         self.kernel: str = sh(["uname", "-r"])
@@ -234,7 +233,6 @@ class NodeData:
         self.node_ip: str = ""
         self.ts_ip: str = ""
 
-        # Alerts / events
         self.alerts: list[Alert] = []
         self.events: deque[Event] = deque(maxlen=24)
         self.overall_status: str = "ok"
@@ -248,7 +246,10 @@ class NodeData:
             if m:
                 self.pve_ver = f"PVE {m.group(1)}"
 
-    # ── FAST TICK (1 s) ─────────────────────────────────────────────────────
+        cinfo = sh(["cat", "/proc/cpuinfo"])
+        m = re.search(r'model name\s*:\s*(.+)', cinfo)
+        if m:
+            self.cpu_model = re.sub(r'\s+', ' ', m.group(1)).strip()
 
     def tick_fast(self):
         self.tick_n += 1
@@ -319,8 +320,6 @@ class NodeData:
                 self._p_disk_time = now
         except Exception:
             pass
-
-    # ── SLOW TICK (5 s) ────────────────────────────────────────────────────
 
     def tick_slow(self):
         self._storage()
@@ -425,8 +424,6 @@ class NodeData:
         if m2:
             self.ts_ip = m2.group(1)
 
-    # ── ALERTS ──────────────────────────────────────────────────────────────
-
     def _update_alerts(self):
         a = []
         if self.cpu_pct > 85:
@@ -462,16 +459,12 @@ class NodeData:
     def _check_events(self):
         if self._last_vm_run and self.vms_running != self._last_vm_run:
             d = "up" if self.vms_running > self._last_vm_run else "down"
-            self.events.append(Event(
-                f"VMs: {self._last_vm_run} → {self.vms_running} ({d})", "info"))
+            self.events.append(Event(f"VMs: {self._last_vm_run} → {self.vms_running} ({d})", "info"))
         self._last_vm_run = self.vms_running
         if self._last_lxc_run and self.lxc_running != self._last_lxc_run:
             d = "up" if self.lxc_running > self._last_lxc_run else "down"
-            self.events.append(Event(
-                f"LXCs: {self._last_lxc_run} → {self.lxc_running} ({d})", "info"))
+            self.events.append(Event(f"LXCs: {self._last_lxc_run} → {self.lxc_running} ({d})", "info"))
         self._last_lxc_run = self.lxc_running
-
-    # ── HELPERS ─────────────────────────────────────────────────────────────
 
     def uptime_str(self) -> str:
         s = int(self.uptime)
@@ -481,16 +474,14 @@ class NodeData:
         return f"{d}d {h:02d}h {m:02d}m" if d else f"{h:02d}h {m:02d}m {s:02d}s"
 
     def status_dot_text(self) -> tuple[str, str]:
-        return {"ok": ("#22c55e", "HEALTHY"),
-                "warn": ("#f59e0b", "WARNING"),
-                "crit": ("#ef4444", "CRITICAL")}[self.overall_status]
+        return {"ok": (OK, "HEALTHY"),
+                "warn": (WARN, "WARNING"),
+                "crit": (CRIT, "CRITICAL")}[self.overall_status]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  WIDGETS — symmetric cards around a centered status panel
+#  WIDGETS
 # ══════════════════════════════════════════════════════════════════════════════
-
-# ── Header ───────────────────────────────────────────────────────────────────
 
 class HeaderWidget(Static):
     def __init__(self, d: NodeData, **kw):
@@ -499,37 +490,38 @@ class HeaderWidget(Static):
 
     def render(self) -> str:
         d = self.d
-        now = datetime.now().strftime("%a %d %b %Y  %H:%M:%S")
+        now = datetime.now().strftime("%a %d %b %Y  •  %H:%M:%S")
         s_col, s_txt = d.status_dot_text()
         return (
-            f"[bold {GOLD}]  ◈  {d.hostname.upper()}[/bold {GOLD}]"
-            f"[{DIM2}]  │  [/{DIM2}][{INFO}]{d.pve_ver}[/{INFO}]"
-            f"[{DIM2}]  │  [/{DIM2}][{DIM}]UP {d.uptime_str()}[/{DIM}]"
-            f"  [{s_col}]●[/{s_col}] [{s_col}]{s_txt}[/{s_col}]"
-            f"[{DIM2}]  │  [/{DIM2}][{WHITE}]{now}[/{WHITE}]"
+            f"[bold {GOLD}]◈ {d.hostname.upper()}[/bold {GOLD}]"
+            f"  [{DIM2}]│[/{DIM2}]  [{INFO}]{d.pve_ver or 'PVE'}[/{INFO}]"
+            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]uptime[/{DIM}] [{WHITE}]{d.uptime_str()}[/{WHITE}]"
+            f"  [{DIM2}]│[/{DIM2}]  [{s_col}]●[/{s_col}] [bold {s_col}]{s_txt}[/bold {s_col}]"
+            f"[{DIM2}]  │  [/{DIM2}][{DIM}]{now}[/{DIM}]"
         )
 
-
-# ── Left column: CPU / Memory / Virtualisation ───────────────────────────────
 
 class CpuCard(Static):
     def __init__(self, d: NodeData, **kw):
         super().__init__(**kw)
         self.d = d
 
+    def on_mount(self) -> None:
+        self.border_title = "CPU"
+
     def render(self) -> str:
         d = self.d
+        self.border_subtitle = (d.cpu_model[:22] + "...") if len(d.cpu_model) > 22 else d.cpu_model
         temp = f"[{CRIT}]{d.cpu_temp:.0f}°C[/{CRIT}]" if d.cpu_temp else f"[{DIM}]--°C[/{DIM}]"
         freq = f"{d.cpu_freq/1000:.2f} GHz" if d.cpu_freq else "-- GHz"
         ld = d.load
-        bar = pct_bar(d.cpu_pct, 18)
-        sp = spark_wide(d.cpu_hist.get(), 20)
+        bar = pct_bar(d.cpu_pct, 20)
+        sp = spark_wide(d.cpu_hist.get(), 22)
         return "\n".join([
-            f"[bold {GOLD}]CPU[/bold {GOLD}]  [{DIM}]i7-14700  20c/28t[/{DIM}]",
             f"{bar}  [{pct_color(d.cpu_pct)}]{d.cpu_pct:>5.1f}%[/]",
-            f"[{DIM}]temp[/{DIM}]  {temp}     [{DIM}]freq[/{DIM}]  [white]{freq}[/white]",
-            f"[{DIM}]load[/{DIM}]  [white]{ld[0]:.2f}[/white]  [{DIM2}]·[/{DIM2}]  [white]{ld[1]:.2f}[/white]  [{DIM2}]·[/{DIM2}]  [white]{ld[2]:.2f}[/white]",
-            f"[{DIM}]hist[/{DIM}]  {sp}",
+            f"[{DIM}]temp[/{DIM}]  {temp}    [{DIM}]freq[/{DIM}]  [{WHITE}]{freq}[/{WHITE}]",
+            f"[{DIM}]load[/{DIM}]  [{WHITE}]{ld[0]:.2f}[/{WHITE}] [{DIM2}]·[/{DIM2}] [{WHITE}]{ld[1]:.2f}[/{WHITE}] [{DIM2}]·[/{DIM2}] [{WHITE}]{ld[2]:.2f}[/{WHITE}]",
+            f"[{DIM}]1m[/{DIM}]    {sp}",
         ])
 
 
@@ -538,19 +530,22 @@ class MemCard(Static):
         super().__init__(**kw)
         self.d = d
 
+    def on_mount(self) -> None:
+        self.border_title = "MEMORY"
+
     def render(self) -> str:
         d = self.d
-        bar = pct_bar(d.mem_pct, 18)
-        sbar = pct_bar(d.swap_pct, 18)
+        self.border_subtitle = human(d.mem_total, 0)
+        bar = pct_bar(d.mem_pct, 20)
+        sbar = pct_bar(d.swap_pct, 20)
         used = human(d.mem_used)
         total = human(d.mem_total)
-        sp = spark_wide(d.mem_hist.get(), 20)
+        sp = spark_wide(d.mem_hist.get(), 22)
         return "\n".join([
-            f"[bold {GOLD}]MEMORY[/bold {GOLD}]  [{DIM}]32 GB DDR5[/{DIM}]",
             f"{bar}  [{pct_color(d.mem_pct)}]{d.mem_pct:>5.1f}%[/]",
-            f"[{DIM}]used[/{DIM}]  [white]{used}[/white]  [{DIM}]of[/{DIM}]  [white]{total}[/white]",
-            f"[{DIM}]swap[/{DIM}] {sbar}  [{pct_color(d.swap_pct)}]{d.swap_pct:>5.1f}%[/]",
-            f"[{DIM}]hist[/{DIM}]  {sp}",
+            f"[{DIM}]used[/{DIM}]  [{WHITE}]{used}[/{WHITE}] [{DIM}]of[/{DIM}] [{WHITE}]{total}[/{WHITE}]",
+            f"[{DIM}]swap[/{DIM}]  {sbar}  [{pct_color(d.swap_pct)}]{d.swap_pct:>5.1f}%[/]",
+            f"[{DIM}]1m[/{DIM}]    {sp}",
         ])
 
 
@@ -559,117 +554,96 @@ class VmCard(Static):
         super().__init__(**kw)
         self.d = d
 
+    def on_mount(self) -> None:
+        self.border_title = "VIRTUALISATION"
+
     def render(self) -> str:
         d = self.d
-        cpu_sp = spark_wide(d.vm_cpu_hist.get(), 20)
-        mem_sp = spark_wide(d.vm_mem_hist.get(), 20)
+        cpu_sp = spark_wide(d.vm_cpu_hist.get(), 22, colour=PURPLE)
+        mem_sp = spark_wide(d.vm_mem_hist.get(), 22, colour=PURPLE)
         run_col = OK if d.vms_running > 0 else DIM
         lxc_col = OK if d.lxc_running > 0 else DIM
         return "\n".join([
-            f"[bold {GOLD}]VIRTUALISATION[/bold {GOLD}]",
-            f"[{run_col}]▶[/{run_col}] [white]VMs[/white]   [{run_col}]{d.vms_running} run[/{run_col}]"
-            f"  [{DIM2}]/[/{DIM2}]  [{DIM}]{d.vms_stopped} stop[/{DIM}]  [{DIM}]{d.vms_total} total[/{DIM}]",
-            f"[{lxc_col}]▶[/{lxc_col}] [white]LXCs[/white]  [{lxc_col}]{d.lxc_running} run[/{lxc_col}]"
-            f"  [{DIM2}]/[/{DIM2}]  [{DIM}]{d.lxc_stopped} stop[/{DIM}]  [{DIM}]{d.lxc_total} total[/{DIM}]",
-            f"",
-            f"[{DIM}]vCPUs[/{DIM}]   [white]{d.vm_total_vcpus:>4}[/white]  [{DIM}]allocated[/{DIM}]",
-            f"[{DIM}]RAM[/{DIM}]    [white]{human_int(d.vm_total_maxmem):>9}[/white]  [{DIM}]allocated[/{DIM}]",
-            f"[{DIM}]CPU[/{DIM}]   [{pct_color(d.vm_cpu_pct)}]{d.vm_cpu_pct:>5.1f}%[/]  {cpu_sp}",
-            f"[{DIM}]MEM[/{DIM}]   [{pct_color(d.vm_mem_pct)}]{d.vm_mem_pct:>5.1f}%[/]  {mem_sp}",
+            f"[{run_col}]▶ VMs [/{run_col}] [bold {run_col}]{d.vms_running}[/bold {run_col}][{DIM}] run[/{DIM}]"
+            f"  [{DIM2}]/[/{DIM2}]  [{DIM}]{d.vms_stopped} stop  {d.vms_total} tot[/{DIM}]",
+            f"[{lxc_col}]▶ LXCs[/{lxc_col}] [bold {lxc_col}]{d.lxc_running}[/bold {lxc_col}][{DIM}] run[/{DIM}]"
+            f"  [{DIM2}]/[/{DIM2}]  [{DIM}]{d.lxc_stopped} stop  {d.lxc_total} tot[/{DIM}]",
+            f"[{DIM}]vCPU[/{DIM}]  [{WHITE}]{d.vm_total_vcpus:>4}[/{WHITE}] [{DIM}]alloc[/{DIM}]"
+            f"   [{DIM}]RAM[/{DIM}] [{WHITE}]{human_int(d.vm_total_maxmem)}[/{WHITE}]",
+            f"[{DIM}]cpu[/{DIM}]   [{pct_color(d.vm_cpu_pct)}]{d.vm_cpu_pct:>5.1f}%[/]  {cpu_sp}",
+            f"[{DIM}]mem[/{DIM}]   [{pct_color(d.vm_mem_pct)}]{d.vm_mem_pct:>5.1f}%[/]  {mem_sp}",
         ])
 
 
-# ── Centre: premium appliance status panel ───────────────────────────────────
-
-class CentrePanel(Static):
-    """The big centred status seal — visual identity of the dashboard."""
+class HeroPanel(Static):
+    """Centred appliance status seal — visual identity of the dashboard."""
 
     def __init__(self, d: NodeData, **kw):
         super().__init__(**kw)
         self.d = d
-        self._tick = 0
+
+    def on_mount(self) -> None:
+        self.border_title = "PROXMOX · 1"
 
     def render(self) -> str:
-        self._tick += 1
         d = self.d
         s_col, s_txt = d.status_dot_text()
+        ip = d.node_ip or d.ts_ip or "─"
+        now_s = datetime.now().strftime("%H:%M:%S")
 
-        # inner box width
-        W = 44
-
-        def centre(text: str, width: int = W) -> str:
+        def centre(text: str, width: int) -> str:
             plain = re.sub(r'\[[^\]]+\]', '', text)
             pad = max(0, width - len(plain))
             lp = pad // 2
-            rp = pad - lp
-            return " " * lp + text + " " * rp
+            return " " * lp + text + " " * (pad - lp)
 
-        H = "═"
-        V = f"[{GOLD}]║[/{GOLD}]"
-        L = f"[{GOLD}]"
-        R = f"[/{GOLD}]"
-
-        top = f"  {L}╔{H * W}╗{R}"
-        bot = f"  {L}╚{H * W}╝{R}"
-
-        now_s = datetime.now().strftime("%H:%M:%S")
-        ip = d.node_ip or d.ts_ip or "─"
-
+        W = 40
         rows = [
-            top,
-            f"{V}{centre(f'[{DIM}]T C E T[/{DIM}]')}{V}",
-            f"{V}{centre(f'[{DIM2}]Centre of Excellence[/{DIM2}]')}{V}",
-            f"{V}{centre(f'[{DIM2}]' + ('─' * 28) + f'[/{DIM2}]')}{V}",
-            f"{V}{centre(f'[bold white]P R O X M O X   1[/bold white]')}{V}",
-            f"{V}{centre(f'[{DIM}]Node · {ip}[/{DIM}]')}{V}",
-            f"{V}{' ' * W}{V}",
-            f"{V}{centre(f'[{s_col}]●[/{s_col}]  [bold {s_col}]{s_txt}[/bold {s_col}]')}{V}",
-            f"{V}{' ' * W}{V}",
-            f"{V}{centre(f'[{DIM}]Up {d.uptime_str()}[/{DIM}]')}{V}",
-            f"{V}{centre(f'[{DIM}]{now_s}[/{DIM}]')}{V}",
-            bot,
+            "",
+            centre(f"[{DIM}]{ORG_NAME}[/{DIM}]", W),
+            centre(f"[{DIM2}]{ORG_SUB}[/{DIM2}]", W),
+            centre(f"[{DIM2}]{'─' * 26}[/{DIM2}]", W),
+            "",
+            centre(f"[{s_col}]●●●[/{s_col}]", W),
+            centre(f"[bold {s_col}]{s_txt}[/bold {s_col}]", W),
+            "",
+            centre(f"[{DIM}]node[/{DIM}]  [bold {WHITE}]{ip}[/bold {WHITE}]", W),
+            centre(f"[{DIM}]up[/{DIM}]    [{WHITE}]{d.uptime_str()}[/{WHITE}]", W),
+            centre(f"[{DIM}]{now_s}[/{DIM}]", W),
+            "",
+            centre(
+                f"[{DIM2}]VMs[/{DIM2}] [{OK}]{'●' * min(d.vms_running,8)}{'○' * min(d.vms_stopped,4)}[/{OK}] [{DIM}]{d.vms_running}/{d.vms_total}[/{DIM}]"
+                f"   [{DIM2}]LXC[/{DIM2}] [{OK}]{'●' * min(d.lxc_running,8)}{'○' * min(d.lxc_stopped,4)}[/{OK}] [{DIM}]{d.lxc_running}/{d.lxc_total}[/{DIM}]",
+                W,
+            ),
         ]
-
-        # Running VMs / LXCs summary line below the box
-        vm_line = (
-            f"  [{DIM2}]VMs[/{DIM2}]  [{OK}]{'●' * d.vms_running}{'○' * d.vms_stopped}[/{OK}]"
-            f"   [{DIM}]{d.vms_running}/{d.vms_total}[/{DIM}]"
-            f"   [{DIM2}]LXCs[/{DIM2}]  [{OK}]{'●' * d.lxc_running}{'○' * d.lxc_stopped}[/{OK}]"
-            f"   [{DIM}]{d.lxc_running}/{d.lxc_total}[/{DIM}]"
-        )
-        rows.append(vm_line)
-
         return "\n".join(rows)
 
-
-# ── Right column: Network / Storage / Alerts ─────────────────────────────────
 
 class NetCard(Static):
     def __init__(self, d: NodeData, **kw):
         super().__init__(**kw)
         self.d = d
 
+    def on_mount(self) -> None:
+        self.border_title = "NETWORK"
+
     def render(self) -> str:
         d = self.d
+        self.border_subtitle = d.node_ip or ""
         up_s = human(d.net_up)
         dn_s = human(d.net_dn)
         tx_s = human_int(d.net_tx_total)
         rx_s = human_int(d.net_rx_total)
-        up_sp = spark_wide(d.net_up_hist.get(), 20)
-        dn_sp = spark_wide(d.net_dn_hist.get(), 20)
-        lines = [
-            f"[bold {GOLD}]NETWORK[/bold {GOLD}]",
-            f"  [{OK}]▲[/{OK}] [white]{up_s:>9}/s[/white]",
-            f"  [{OK}]{up_sp}[/{OK}]",
-            f"  [{INFO}]▼[/{INFO}] [white]{dn_s:>9}/s[/white]",
-            f"  [{INFO}]{dn_sp}[/{INFO}]",
-            f"  [{DIM}]TX[/{DIM}] [white]{tx_s:>10}[/white]  [{DIM}]RX[/{DIM}] [white]{rx_s:>10}[/white]",
-        ]
-        if d.node_ip:
-            lines.append(
-                f"  [{DIM}]vmbr0[/{DIM}]  [white]{d.node_ip:<14}[/white]"
-            )
-        return "\n".join(lines)
+        up_sp = spark_wide(d.net_up_hist.get(), 22, colour=OK)
+        dn_sp = spark_wide(d.net_dn_hist.get(), 22, colour=INFO)
+        return "\n".join([
+            f"[{OK}]▲ up  [/{OK}] [{WHITE}]{up_s:>10}/s[/{WHITE}]",
+            f"       {up_sp}",
+            f"[{INFO}]▼ down[/{INFO}] [{WHITE}]{dn_s:>10}/s[/{WHITE}]",
+            f"       {dn_sp}",
+            f"[{DIM}]tx[/{DIM}] [{WHITE}]{tx_s:>9}[/{WHITE}]   [{DIM}]rx[/{DIM}] [{WHITE}]{rx_s:>9}[/{WHITE}]",
+        ])
 
 
 class StorageCard(Static):
@@ -677,30 +651,32 @@ class StorageCard(Static):
         super().__init__(**kw)
         self.d = d
 
+    def on_mount(self) -> None:
+        self.border_title = "STORAGE"
+
     def render(self) -> str:
         d = self.d
         lines = [
-            f"[bold {GOLD}]STORAGE[/bold {GOLD}]",
-            f"  [{DIM}]root[/{DIM}]  {pct_bar(d.root_pct, 18)}  [{pct_color(d.root_pct)}]{d.root_pct:.1f}%[/]",
-            f"  [{DIM}]ext4[/{DIM}]  [white]{human(d.root_used)}[/]  [{DIM2}]/[/{DIM2}]  [{DIM}]{human(d.root_total)}[/{DIM}]",
+            f"[{DIM}]root[/{DIM}]  {pct_bar(d.root_pct, 20)}  [{pct_color(d.root_pct)}]{d.root_pct:>4.1f}%[/]",
+            f"[{DIM}]ext4[/{DIM}]  [{WHITE}]{human(d.root_used)}[/{WHITE}] [{DIM2}]/[/{DIM2}] [{DIM}]{human(d.root_total)}[/{DIM}]",
         ]
         if d.lvm_pct:
             lines += [
-                f"  [{DIM}]data[/{DIM}]  {pct_bar(d.lvm_pct, 18)}  [{pct_color(d.lvm_pct)}]{d.lvm_pct:.1f}%[/]",
-                f"  [{DIM}]thin[/{DIM}]  [white]{d.lvm_used_gb:.1f}G[/]  [{DIM2}]/[/{DIM2}]  [{DIM}]{d.lvm_total_gb:.0f}G[/{DIM}]",
+                f"[{DIM}]thin[/{DIM}]  {pct_bar(d.lvm_pct, 20)}  [{pct_color(d.lvm_pct)}]{d.lvm_pct:>4.1f}%[/]",
+                f"[{DIM}]data[/{DIM}]  [{WHITE}]{d.lvm_used_gb:.1f}G[/{WHITE}] [{DIM2}]/[/{DIM2}] [{DIM}]{d.lvm_total_gb:.0f}G[/{DIM}]",
             ]
         for pool in d.zfs_pools[:2]:
             hcol = OK if pool["health"] == "ONLINE" else CRIT
             lines.append(
-                f"  [{hcol}]◈[/{hcol}] [{DIM}]{pool['name']:<8}[/{DIM}]"
-                f"[{hcol}]{pool['health']:<6}[/{hcol}]"
-                f"[white]{pool['capacity']:>3}%[/white]"
+                f"[{hcol}]◈ {pool['name']:<8}[/{hcol}]"
+                f"[{hcol}]{pool['health']:<7}[/{hcol}]"
+                f"[{WHITE}]{pool['capacity']:>3}%[/{WHITE}]"
             )
         if d.zfs_arc_max:
             arc_pct = d.zfs_arc_size / d.zfs_arc_max * 100
             lines.append(
-                f"  [{DIM}]ARC[/{DIM}]  {pct_bar(arc_pct, 12)}  [{pct_color(arc_pct)}]{arc_pct:.0f}%[/]"
-                f"  [{DIM}]{human_int(d.zfs_arc_size)}[/{DIM}]"
+                f"[{DIM}]arc[/{DIM}]   {pct_bar(arc_pct, 14)}  [{pct_color(arc_pct)}]{arc_pct:>3.0f}%[/]"
+                f" [{DIM}]{human_int(d.zfs_arc_size)}[/{DIM}]"
             )
         return "\n".join(lines)
 
@@ -710,29 +686,27 @@ class AlertsCard(Static):
         super().__init__(**kw)
         self.d = d
 
+    def on_mount(self) -> None:
+        self.border_title = "ALERTS"
+
     def render(self) -> str:
         d = self.d
-        lines = [
-            f"[bold {GOLD}]ALERTS[/bold {GOLD}]",
-        ]
+        lines = []
         for a in d.alerts[:5]:
             if a.severity == "ok":
-                lines.append(f"  [{OK}]✓[/{OK}]  [{OK}]{a.message:<24}[/{OK}]")
+                lines.append(f"[{OK}]✓ {a.message:<24}[/{OK}]")
             elif a.severity == "warn":
-                lines.append(f"  [{WARN}]⚡[/{WARN}]  [{WARN}]{a.message:<24}[/{WARN}]")
+                lines.append(f"[{WARN}]⚡ {a.message:<24}[/{WARN}]")
             else:
-                lines.append(f"  [{CRIT}]●[/{CRIT}]  [{CRIT}]{a.message:<24}[/{CRIT}]")
+                lines.append(f"[{CRIT}]● {a.message:<24}[/{CRIT}]")
         if d.events:
-            lines.append("")
-            lines.append(f"[{DIM2}]── recent ──[/{DIM2}]")
+            lines.append(f"[{DIM2}]{'─' * 22}[/{DIM2}]")
+            cols = {"ok": OK, "warn": WARN, "info": INFO, "crit": CRIT}
             for ev in list(d.events)[-3:]:
-                cols = {"ok": OK, "warn": WARN, "info": INFO, "crit": CRIT}
                 c = cols.get(ev.kind, DIM)
-                lines.append(f"  [{DIM}]{ev.time}[/{DIM}]  [{c}]{ev.message[:20]:<20}[/{c}]")
+                lines.append(f"[{DIM}]{ev.time}[/{DIM}] [{c}]{ev.message[:20]}[/{c}]")
         return "\n".join(lines)
 
-
-# ── Lower half: 4 large full-width history graphs ────────────────────────────
 
 class GraphArea(Static):
     """Four full-width animated graphs: CPU, MEM, NET, DISK."""
@@ -741,121 +715,70 @@ class GraphArea(Static):
         super().__init__(**kw)
         self.d = d
 
-    def _graph_block(self, title: str, colour: str,
-                     hist: History, unit: str,
-                     w: int, extra: str = "",
-                     hist2: Optional[History] = None,
-                     label2: str = "") -> list[str]:
-        val = hist.last()
-        sp = spark_wide(hist.get(), w)
-        col = pct_color(val) if unit == "%" else colour
-        val_s = f"[{col}]{val:>5.1f}{unit}[/{col}]"
-        vals = hist.get()
-        mn = f"{min(vals):.1f}" if vals else "─"
-        mx = f"{max(vals):.1f}" if vals else "─"
-        lines = [
-            f"  [{colour}]━━━[/{colour}] [bold {colour}]{title}[/]  {val_s}"
-            f"[{DIM}]     min[/{DIM}] [white]{mn}[/white][{DIM}]  max[/{DIM}] [white]{mx}[/white]"
-            f"  {extra}",
-            f"  {sp}",
-        ]
-        if hist2:
-            v2 = hist2.last()
-            col2 = pct_color(v2) if unit == "%" else colour
-            v2_s = f"[{col2}]{v2:>5.1f}{unit}[/{col2}]"
-            sp2 = spark_wide(hist2.get(), w)
-            vals2 = hist2.get()
-            mn2 = f"{min(vals2):.1f}" if vals2 else "─"
-            mx2 = f"{max(vals2):.1f}" if vals2 else "─"
-            lines += [
-                f"  [{label2}]  {v2_s}"
-                f"[{DIM}]     min[/{DIM}] [white]{mn2}[/white][{DIM}]  max[/{DIM}] [white]{mx2}[/white]",
-                f"  {sp2}",
-            ]
-        return lines
+    def on_mount(self) -> None:
+        self.border_title = "PERFORMANCE HISTORY"
+        self.border_subtitle = "last 120s"
 
     def render(self) -> str:
         try:
             return self._render_graphs()
         except Exception as exc:
-            return (
-                f"  [{DIM}]graph render error: {exc}[/{DIM}]\n"
-                f"  [{DIM}]will retry on next tick[/{DIM}]"
-            )
+            return f"[{DIM}]graph render error: {exc} — retrying next tick[/{DIM}]"
+
+    def _row(self, label: str, colour: str, val: float, hist: History,
+              w: int, extra: str = "") -> list[str]:
+        vals = hist.get()
+        mn = f"{min(vals):.1f}" if vals else "─"
+        mx = f"{max(vals):.1f}" if vals else "─"
+        sp = spark_wide(vals, w, colour=colour)
+        head = (
+            f"[bold {colour}]{label:<10}[/bold {colour}]"
+            f"[{pct_color(val)}]{val:>5.1f}%[/]"
+            f"  [{DIM}]min[/{DIM}] [{WHITE}]{mn:>5}[/{WHITE}]"
+            f"  [{DIM}]max[/{DIM}] [{WHITE}]{mx:>5}[/{WHITE}]"
+            f"  {extra}"
+        )
+        return [head, f"  {sp}"]
 
     def _render_graphs(self) -> str:
         d = self.d
-        w = 234
+        w = max(20, self.size.width - 4) if self.size.width else 100
 
-        lines = []
+        lines: list[str] = []
 
-        # CPU
         extra = f"[{DIM}]load[/{DIM}] [{WHITE}]{d.load[0]:.2f}[/{WHITE}]"
-        lines += self._graph_block("CPU UTILIZATION", GOLD, d.cpu_hist, "%", w, extra)
+        lines += self._row("CPU", GOLD, d.cpu_pct, d.cpu_hist, w, extra)
         lines.append("")
 
-        # Memory
         extra = f"[{DIM}]swap[/{DIM}] [{pct_color(d.swap_pct)}]{d.swap_pct:.1f}%[/]"
-        lines += self._graph_block("MEMORY USAGE", INFO, d.mem_hist, "%", w, extra)
+        lines += self._row("MEMORY", INFO, d.mem_pct, d.mem_hist, w, extra)
         lines.append("")
 
-        # Network (dual sparkline)
-        up_val = d.net_up_hist.last()
-        dn_val = d.net_dn_hist.last()
-        up_s = human(d.net_up)
-        dn_s = human(d.net_dn)
+        up_val, dn_val = d.net_up_hist.last(), d.net_dn_hist.last()
         extra_net = (
-            f"[{OK}]▲[/{OK}] [{WHITE}]{up_s}[/{WHITE}]/s"
-            f"   [{INFO}]▼[/{INFO}] [{WHITE}]{dn_s}[/{WHITE}]/s"
-            f"   [{DIM}]TX[/{DIM}] [{WHITE}]{human_int(d.net_tx_total)}[/{WHITE}]"
-            f"   [{DIM}]RX[/{DIM}] [{WHITE}]{human_int(d.net_rx_total)}[/{WHITE}]"
+            f"[{OK}]▲[/{OK}] [{WHITE}]{human(d.net_up)}/s[/{WHITE}]"
+            f"  [{INFO}]▼[/{INFO}] [{WHITE}]{human(d.net_dn)}/s[/{WHITE}]"
+            f"  [{DIM}]tx[/{DIM}] [{WHITE}]{human_int(d.net_tx_total)}[/{WHITE}]"
+            f"  [{DIM}]rx[/{DIM}] [{WHITE}]{human_int(d.net_rx_total)}[/{WHITE}]"
         )
-        lines.append(
-            f"  [{INFO}]━━━[/{INFO}] [bold {INFO}]NETWORK THROUGHPUT[/bold {INFO}]  {extra_net}"
-        )
-        lines.append(f"  [{OK}]{spark_wide(d.net_up_hist.get(), w)}[/{OK}]")
-        lines.append(
-            f"  [{DIM}]▲  up[/{DIM}]  [{pct_color(up_val)}]{up_val:>5.1f}%[/]"
-            f"[{DIM}]  min[/{DIM}] [white]{min(d.net_up_hist.get()):.1f}[/white]"
-            f"[{DIM}]  max[/{DIM}] [white]{max(d.net_up_hist.get()):.1f}[/white]"
-        )
-        lines.append(f"  [{INFO}]{spark_wide(d.net_dn_hist.get(), w)}[/{INFO}]")
-        lines.append(
-            f"  [{DIM}]▼  dn[/{DIM}]  [{pct_color(dn_val)}]{dn_val:>5.1f}%[/]"
-            f"[{DIM}]  min[/{DIM}] [white]{min(d.net_dn_hist.get()):.1f}[/white]"
-            f"[{DIM}]  max[/{DIM}] [white]{max(d.net_dn_hist.get()):.1f}[/white]"
-        )
+        lines.append(f"[bold {TEAL}]NETWORK   [/bold {TEAL}]{extra_net}")
+        lines.append(f"  {spark_wide(d.net_up_hist.get(), w, colour=OK)}")
+        lines.append(f"  {spark_wide(d.net_dn_hist.get(), w, colour=INFO)}")
         lines.append("")
 
-        # Disk I/O (dual sparkline)
-        r_val = d.disk_r_hist.last()
-        w_val = d.disk_w_hist.last()
+        r_val, w_val = d.disk_r_hist.last(), d.disk_w_hist.last()
         r_actual = r_val / 100 * d._disk_ceil
         w_actual = w_val / 100 * d._disk_ceil
         extra_disk = (
-            f"[{OK}]R[/{OK}] [{WHITE}]{human(r_actual)}[/{WHITE}]/s"
-            f"   [{INFO}]W[/{INFO}] [{WHITE}]{human(w_actual)}[/{WHITE}]/s"
+            f"[{OK}]R[/{OK}] [{WHITE}]{human(r_actual)}/s[/{WHITE}]"
+            f"  [{INFO}]W[/{INFO}] [{WHITE}]{human(w_actual)}/s[/{WHITE}]"
         )
-        lines.append(
-            f"  [{OK}]━━━[/{OK}] [bold {OK}]DISK THROUGHPUT[/bold {OK}]  {extra_disk}"
-        )
-        lines.append(f"  [{OK}]{spark_wide(d.disk_r_hist.get(), w)}[/{OK}]")
-        lines.append(
-            f"  [{DIM}]R  read[/{DIM}]  [{pct_color(r_val)}]{r_val:>5.1f}%[/]"
-            f"[{DIM}]  min[/{DIM}] [white]{min(d.disk_r_hist.get()):.1f}[/white]"
-            f"[{DIM}]  max[/{DIM}] [white]{max(d.disk_r_hist.get()):.1f}[/white]"
-        )
-        lines.append(f"  [{INFO}]{spark_wide(d.disk_w_hist.get(), w)}[/{INFO}]")
-        lines.append(
-            f"  [{DIM}]W  write[/{DIM}] [{pct_color(w_val)}]{w_val:>5.1f}%[/]"
-            f"[{DIM}]  min[/{DIM}] [white]{min(d.disk_w_hist.get()):.1f}[/white]"
-            f"[{DIM}]  max[/{DIM}] [white]{max(d.disk_w_hist.get()):.1f}[/white]"
-        )
+        lines.append(f"[bold {ORANGE}]DISK I/O  [/bold {ORANGE}]{extra_disk}")
+        lines.append(f"  {spark_wide(d.disk_r_hist.get(), w, colour=OK)}")
+        lines.append(f"  {spark_wide(d.disk_w_hist.get(), w, colour=INFO)}")
 
         return "\n".join(lines)
 
-
-# ── Footer ───────────────────────────────────────────────────────────────────
 
 class FooterWidget(Static):
     def __init__(self, d: NodeData, **kw):
@@ -864,16 +787,17 @@ class FooterWidget(Static):
 
     def render(self) -> str:
         d = self.d
-        k = d.kernel[:30] if d.kernel else "─"
+        k = d.kernel[:28] if d.kernel else "─"
+        sep = f"  [{DIM2}]│[/{DIM2}]  "
         return (
-            f"[{DIM}]  kernel[/{DIM}] [white]{k:<30}[/white]"
-            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]cpu[/{DIM}] [{pct_color(d.cpu_pct)}]{d.cpu_pct:.0f}%[/]"
-            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]mem[/{DIM}] [{pct_color(d.mem_pct)}]{d.mem_pct:.0f}%[/]"
-            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]v[/{DIM}] [{OK}]{d.vms_running}[/{OK}][{DIM2}]/[/{DIM2}][white]{d.vms_total}[/white]"
-            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]c[/{DIM}] [{OK}]{d.lxc_running}[/{OK}][{DIM2}]/[/{DIM2}][white]{d.lxc_total}[/white]"
-            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]root[/{DIM}] [{pct_color(d.root_pct)}]{d.root_pct:.0f}%[/]"
-            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]swap[/{DIM}] [{pct_color(d.swap_pct)}]{d.swap_pct:.0f}%[/]"
-            f"  [{DIM2}]│[/{DIM2}]  [{DIM}]tick[/{DIM}] [white]{d.tick_n}[/white]"
+            f"[{DIM}]kernel[/{DIM}] [{WHITE}]{k}[/{WHITE}]"
+            f"{sep}[{DIM}]cpu[/{DIM}] [{pct_color(d.cpu_pct)}]{d.cpu_pct:.0f}%[/]"
+            f"{sep}[{DIM}]mem[/{DIM}] [{pct_color(d.mem_pct)}]{d.mem_pct:.0f}%[/]"
+            f"{sep}[{DIM}]vm[/{DIM}] [{OK}]{d.vms_running}[/{OK}][{DIM2}]/[/{DIM2}][{WHITE}]{d.vms_total}[/{WHITE}]"
+            f"{sep}[{DIM}]ct[/{DIM}] [{OK}]{d.lxc_running}[/{OK}][{DIM2}]/[/{DIM2}][{WHITE}]{d.lxc_total}[/{WHITE}]"
+            f"{sep}[{DIM}]root[/{DIM}] [{pct_color(d.root_pct)}]{d.root_pct:.0f}%[/]"
+            f"{sep}[{DIM}]swap[/{DIM}] [{pct_color(d.swap_pct)}]{d.swap_pct:.0f}%[/]"
+            f"{sep}[{DIM}]tick[/{DIM}] [{WHITE}]{d.tick_n}[/{WHITE}]"
         )
 
 
@@ -882,85 +806,90 @@ class FooterWidget(Static):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class OperationsDashboard(App):
-    CSS = """
-    Screen {
-        background: #0a0e1a;
-        color: #c0cce0;
+    CSS = f"""
+    Screen {{
+        background: {BG};
+        color: {WHITE};
         layout: vertical;
-    }
+    }}
 
-    #header {
+    #header {{
         height: 1;
-        background: #0d1220;
-        border-bottom: tall #1e2a3a;
+        background: {PANEL_BG};
+        border-bottom: solid {BORDER};
         padding: 0 2;
         content-align: left middle;
-    }
+    }}
 
-    #footer {
+    #footer {{
         height: 1;
-        background: #0d1220;
-        border-top: tall #1e2a3a;
+        background: {PANEL_BG};
+        border-top: solid {BORDER};
         padding: 0 2;
         content-align: left middle;
-    }
+    }}
 
-    /* ── Main body: symmetric 3-column ── */
-    #body {
+    #body {{
         height: 1fr;
         layout: horizontal;
-    }
+        background: {BG};
+    }}
 
-    .side-col {
-        width: 26;
+    .side-col {{
+        width: 36;
         layout: vertical;
-    }
+        padding: 1 1;
+    }}
 
-    #left {
-        border-right: tall #1e2a3a;
-        padding: 1 0 1 1;
-    }
-
-    #right {
-        border-left: tall #1e2a3a;
-        padding: 1 1 1 0;
-    }
-
-    /* ── Centre: appliance panel ── */
-    #centre-area {
+    #centre-area {{
         width: 1fr;
         layout: vertical;
         align: center middle;
         content-align: center middle;
-    }
+        padding: 1 2;
+    }}
 
-    #centre-panel {
-        width: auto;
+    #hero {{
+        width: 46;
         height: auto;
-        content-align: center middle;
-        align: center middle;
-    }
+        border: heavy {GOLD};
+        background: {CARD_BG};
+        border-title-color: {GOLD};
+        border-title-style: bold;
+        border-title-align: center;
+        border-subtitle-color: {DIM};
+        padding: 1 2;
+        content-align: center top;
+    }}
 
-    /* ── Card sections ── */
-    .card {
+    .card {{
         height: auto;
-        padding: 1 1;
-        border-bottom: tall #1e2a3a;
-    }
+        background: {CARD_BG};
+        border: round {BORDER};
+        border-title-style: bold;
+        border-subtitle-color: {DIM};
+        padding: 1 2;
+        margin-bottom: 1;
+    }}
 
+    .card-cpu     {{ border: round {GOLD};   border-title-color: {GOLD}; }}
+    .card-mem     {{ border: round {INFO};   border-title-color: {INFO}; }}
+    .card-vm      {{ border: round {PURPLE}; border-title-color: {PURPLE}; }}
+    .card-net     {{ border: round {TEAL};   border-title-color: {TEAL}; }}
+    .card-storage {{ border: round {ORANGE}; border-title-color: {ORANGE}; }}
+    .card-alerts  {{ border: round {BORDER}; border-title-color: {WHITE}; }}
 
-
-    /* ── Lower graphs ── */
-    #graphs {
+    #graphs {{
         height: 1fr;
-        padding: 1 0;
-        border-top: tall #1e2a3a;
-        background: #0c1020;
-    }
-
-    #graphs-widget {
-        height: 1fr;
-    }
+        min-height: 16;
+        margin: 0 2 1 2;
+        background: {CARD_BG};
+        border: round {BORDER};
+        border-title-color: {WHITE};
+        border-title-style: bold;
+        border-subtitle-color: {DIM};
+        padding: 1 2;
+    }}
     """
 
     TITLE = "Proxmox NOC Dashboard"
@@ -976,22 +905,17 @@ class OperationsDashboard(App):
     def compose(self) -> ComposeResult:
         yield HeaderWidget(self.d, id="header")
         with Horizontal(id="body"):
-            # Left column: cards stacked vertically
             with Vertical(id="left", classes="side-col"):
-                yield CpuCard(self.d, classes="card", id="cpu-card")
-                yield MemCard(self.d, classes="card", id="mem-card")
-                yield VmCard(self.d, classes="card", id="vm-card")
-            # Centre: the appliance seal
+                yield CpuCard(self.d, classes="card card-cpu", id="cpu-card")
+                yield MemCard(self.d, classes="card card-mem", id="mem-card")
+                yield VmCard(self.d, classes="card card-vm", id="vm-card")
             with Vertical(id="centre-area"):
-                yield CentrePanel(self.d, id="centre-panel")
-            # Right column
+                yield HeroPanel(self.d, id="hero")
             with Vertical(id="right", classes="side-col"):
-                yield NetCard(self.d, classes="card", id="net-card")
-                yield StorageCard(self.d, classes="card", id="storage-card")
-                yield AlertsCard(self.d, classes="card", id="alerts-card")
-        # Lower half: full-width graphs
-        with Vertical(id="graphs"):
-            yield GraphArea(self.d, id="graphs-widget")
+                yield NetCard(self.d, classes="card card-net", id="net-card")
+                yield StorageCard(self.d, classes="card card-storage", id="storage-card")
+                yield AlertsCard(self.d, classes="card card-alerts", id="alerts-card")
+        yield GraphArea(self.d, id="graphs")
         yield FooterWidget(self.d, id="footer")
 
     def on_mount(self) -> None:
@@ -1003,8 +927,8 @@ class OperationsDashboard(App):
         if self._slow % 5 == 0:
             self.d.tick_slow()
         for wid in ("header", "cpu-card", "mem-card", "vm-card",
-                     "centre-panel", "net-card", "storage-card",
-                     "alerts-card", "graphs-widget", "footer"):
+                    "hero", "net-card", "storage-card",
+                    "alerts-card", "graphs", "footer"):
             try:
                 self.query_one(f"#{wid}").refresh()
             except Exception:
@@ -1030,8 +954,6 @@ def main():
 
     _B.open = _tty_redirect
 
-    # Textual falls back to stderr when /dev/tty is unavailable.
-    # Redirect stderr → stdout → /dev/tty1 (set by StandardOutput=tty).
     try:
         os.dup2(1, 2)
     except OSError:
